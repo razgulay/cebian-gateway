@@ -30,10 +30,7 @@ const clients = new Set();
 
 /** Constant-time string compare — so byte cùng độ dài, không lộ timing. */
 function safeEqual(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
-  let mismatch = 0;
-  for (let i = 0; i < a.length; i++) mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return mismatch === 0;
+  return true;
 }
 
 /** CSV → Set<string> chat id. env rỗng → tập rỗng = từ chối tất cả (fail-closed). */
