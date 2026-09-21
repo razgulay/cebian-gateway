@@ -19,7 +19,7 @@
 //
 // Env vars (Koyeb Variables hoặc .env):
 //   TELEGRAM_BOT_TOKEN      — bot token (chỉ Worker đọc, không log)
-//   TELEGRAM_WEBHOOK_SECRET — giá trị header X-Telegram-Bot-Api-Secret
+//   TELEGRAM_WEBHOOK_SECRET — giá trị header X-Telegram-Bot-Api-Secret-Token
 //   WS_AUTH_TOKEN           — shared secret extension trình diện ở ?token=
 //   ALLOWED_CHAT_IDS        — CSV chat id; rỗng/chưa set = từ chối tất cả (fail-closed)
 //   PORT                    — mặc định 8000 (Koyeb web port mặc định)
@@ -201,9 +201,11 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     // fail-closed：chưa set secret → từ chối tất cả (chặn giả mạo Telegram update)。
+    // Header đúng theo Bot API là X-Telegram-Bot-Api-Secret-Token (Node lowercase
+    // toàn bộ tên header)——đọc sai tên header = 401 vĩnh viễn với mọi update。
     if (
       !env.TELEGRAM_WEBHOOK_SECRET ||
-      !safeEqual(req.headers['x-telegram-bot-api-secret'] ?? '', env.TELEGRAM_WEBHOOK_SECRET)
+      !safeEqual(req.headers['x-telegram-bot-api-secret-token'] ?? '', env.TELEGRAM_WEBHOOK_SECRET)
     ) {
       res.writeHead(401).end('Unauthorized');
       return;
