@@ -14,6 +14,7 @@
 //                        { kind: 'sendChatAction', request_id, chat_id, action }
 //                        { kind: 'editMessage', request_id, chat_id, message_id, text, parse_mode? }
 //                        { kind: 'setMessageReaction', request_id, chat_id, message_id, emoji? }
+//                        { kind: 'deleteMessage', request_id, chat_id, message_id }
 //   Worker → extension : { kind: 'sendMessage_result', request_id, ok, message_id?, error? }
 //                        { kind: 'gateway_result', request_id, ok, error? }（后两种 action 用）
 //
@@ -154,6 +155,30 @@ async function callSetMessageReaction(chatId, messageId, emoji) {
     });
     const json = await res.json().catch(() => ({}));
     if (json.ok) return { ok: true };
+    return {
+      ok: false,
+      error: json.description ? `${res.status}: ${json.description}` : `status ${res.status}`,
+    };
+  } catch (err) {
+    return { ok: false, error: `telegram api unreachable: ${String(err)}` };
+  }
+}
+
+/** deleteMessage — Step-Progress 收尾用：正式回覆落位後刪掉臨時工具狀態行。
+ *  'message to delete not found' 吞掉視為 ok（冪等——重複刪除 / 已刪不報錯，
+ *  同 'message is not modified' 的處理先例）。 */
+async function callDeleteMessage(chatId, messageId) {
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/deleteMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
+    });
+    const json = await res.json().catch(() => ({}));
+    if (json.ok) return { ok: true };
+    if (typeof json.description === 'string' && json.description.includes('message to delete not found')) {
+      return { ok: true };
+    }
     return {
       ok: false,
       error: json.description ? `${res.status}: ${json.description}` : `status ${res.status}`,
@@ -331,6 +356,13 @@ wss.on('connection', (ws) => {
           }
           result = await callSetMessageReaction(data.chat_id, data.message_id, data.emoji);
           break;
+        case 'deleteMessage':
+          if (typeof data.message_id !== 'number') {
+            result = { ok: false, error: 'message_id required' };
+            break;
+          }
+          result = await callDeleteMessage(data.chat_id, data.message_id);
+          break;
         default:
           return; // 未知 kind——静默忽略
       }
@@ -338,7 +370,7 @@ wss.on('connection', (ws) => {
 
     // request_id 必须回显——extension 用它配对 in-flight 请求。
     // sendMessage 保留 'sendMessage_result'（向后兼容旧 extension）；
-    // sendChatAction / editMessage / setMessageReaction 用 'gateway_result'。
+    // sendChatAction / editMessage / setMessageReaction / deleteMessage 用 'gateway_result'。
     const replyKind = data.kind === 'sendMessage' ? 'sendMessage_result' : 'gateway_result';
     try {
       ws.send(
