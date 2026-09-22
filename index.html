@@ -1,0 +1,1342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Cebian</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <!--
+    Cebian Telegram Mini App — UX v3.
+    Single-file vanilla HTML/CSS/JS (no CDN libs; markdown parser in-house).
+
+    Layout:
+      ┌─ header (frosted) ───────────────────┐
+      │ Cebian · status-pill              │
+      ├─ tab bar (frosted) ────────────────┤
+      │ Chat | Actions | [+ New Chat]       │
+      ├─ observation banner (conditional) ─┤  ← shows when tools active
+      │ 👁️ Agent observing Chrome...       │
+      ├─ sticky user message (conditional) ┤  ← user bubble pins to top
+      │ [user bubble]                       │
+      ├─ chat stream (scrollable) ──────────┤
+      │ [agent stream + tool pills + …]   │
+      ├─ composer (frosted) ────────────────┤
+      │ [textarea] [↑]                    │
+      └────────────────────────────────────┘
+
+    Wire (lib/telegram-gateway/types.ts):
+      Mini App → Gateway  : { kind:'webapp_action', request_id, action }
+      Gateway → Mini App  : { kind:'webapp_action_result', request_id, ok,
+                              partial?, data?, error? }
+      Gateway → Mini App  : { kind:'webapp_tool_event', request_id, phase,
+                              tool_name, label, elapsed_ms? }
+      Gateway → Mini App  : { kind:'extension_status', online: boolean }
+  -->
+  <style>
+    :root {
+      --bg: var(--tg-theme-bg-color, #17212b);
+      --bg-elev: var(--tg-theme-secondary-bg-color, #1e2c39);
+      --fg: var(--tg-theme-text-color, #e6e6e6);
+      --fg-muted: var(--tg-theme-hint-color, #7d8e9a);
+      --accent: var(--tg-theme-button-color, #2ea6da);
+      --danger: #e53935;
+      --ok: #43a047;
+      --warning: #ff9800;
+
+      --glass-bg: rgba(30, 44, 57, 0.62);
+      --glass-border: rgba(255, 255, 255, 0.07);
+      --shadow-md: 0 4px 24px rgba(0, 0, 0, 0.35);
+      --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.25);
+      --radius-md: 14px;
+      --radius-lg: 20px;
+    }
+    :root[data-theme="light"] {
+      --bg: #ffffff;
+      --bg-elev: #f4f7fa;
+      --fg: #0f172a;
+      --fg-muted: #64748b;
+      --glass-bg: rgba(255, 255, 255, 0.78);
+      --glass-border: rgba(15, 23, 42, 0.08);
+      --shadow-md: 0 4px 20px rgba(15, 23, 42, 0.08);
+      --shadow-sm: 0 1px 3px rgba(15, 23, 42, 0.06);
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+      background: var(--bg);
+      color: var(--fg);
+      font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+      overflow: hidden;
+      -webkit-tap-highlight-color: transparent;
+    }
+    button { font: inherit; color: inherit; }
+
+    .app {
+      display: flex; flex-direction: column;
+      height: 100%; max-width: 640px; margin: 0 auto;
+    }
+
+    /* ─── Header ────────────────────────────────────────────────── */
+    .header {
+      padding: 12px 16px;
+      background: var(--glass-bg);
+      backdrop-filter: blur(16px) saturate(180%); -webkit-backdrop-filter: blur(16px) saturate(180%);
+      border-bottom: 1px solid var(--glass-border);
+      display: flex; align-items: center; gap: 10px;
+      font-weight: 600;
+      z-index: 5;
+    }
+    .header .title { flex: 1; }
+    .header .status-pill {
+      font-size: 11px; font-weight: 500;
+      padding: 4px 10px; border-radius: 999px;
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--fg-muted);
+      display: flex; align-items: center; gap: 6px;
+    }
+    .header .status-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--fg-muted);
+      transition: background 0.3s, box-shadow 0.3s;
+    }
+    .header .status-pill.online .status-dot {
+      background: var(--ok);
+      box-shadow: 0 0 8px rgba(67, 160, 71, 0.7);
+    }
+
+    /* ─── Tab bar ─────────────────────────────────────────────── */
+    .tabs {
+      display: flex; align-items: center;
+      background: var(--glass-bg);
+      backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+      border-bottom: 1px solid var(--glass-border);
+      padding: 0 8px;
+    }
+    .tab-group { display: flex; flex: 1; }
+    .tab-btn {
+      flex: 1; padding: 14px 8px;
+      background: none; border: 0;
+      border-bottom: 2px solid transparent;
+      color: var(--fg-muted);
+      font-weight: 600;
+      cursor: pointer;
+      transition: color 0.2s, border-color 0.2s;
+    }
+    .tab-btn.active { color: var(--fg); border-bottom-color: var(--accent); }
+    .new-chat-btn {
+      width: 38px; height: 38px;
+      background: transparent;
+      color: var(--accent);
+      border: 1px solid var(--glass-border);
+      border-radius: 50%;
+      font-size: 20px; line-height: 1;
+      cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      flex: 0 0 auto;
+      margin: 0 4px 0 8px;
+      transition: background 0.15s, transform 0.1s;
+    }
+    .new-chat-btn:active { transform: scale(0.92); }
+    .new-chat-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+    .new-chat-btn.spinning { animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ─── Observation banner ─────────────────────────────────── */
+    .banner {
+      padding: 10px 14px;
+      background: rgba(255, 152, 0, 0.10);
+      border-bottom: 1px solid rgba(255, 152, 0, 0.30);
+      display: none;
+      align-items: center; gap: 10px;
+      font-size: 13px;
+      color: var(--warning);
+      backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    }
+    .banner.active { display: flex; }
+    .banner .eye {
+      font-size: 20px;
+      animation: blink 1s ease-in-out infinite;
+      display: inline-block;
+    }
+    @keyframes blink {
+      0%, 100% { transform: scale(1); }
+      50% { transform: scale(1.25); }
+    }
+    .banner .pulse-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--warning);
+      box-shadow: 0 0 6px rgba(255, 152, 0, 0.6);
+      animation: pulse 1.4s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 0.4; transform: scale(0.85); }
+      50% { opacity: 1; transform: scale(1.1); }
+    }
+    .banner .text { flex: 1; }
+    .banner .count {
+      font-size: 11px; padding: 2px 8px;
+      background: rgba(255, 152, 0, 0.18);
+      border-radius: 999px;
+    }
+
+    /* ─── Sticky user message ─────────────────────────────────── */
+    /* 独立层 —— 不在 .chat-stream 滚动容器内（DOM 上是 .app 的直接子元素，
+     * 与 .view-chat 平级）。加 position:sticky / z-index 作为防御（浏览器
+     * 对 flex 布局的 sticky 支持偶有差异），真正起作用的是"不在 overflow-y:
+     * auto 的容器里"这一布局事实 —— .chat-stream 滚动时 sticky-user 永远
+     * 停在原位。 */
+    .sticky-user {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      padding: 10px 12px;
+      background: var(--glass-bg);
+      backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+      border-bottom: 1px solid var(--glass-border);
+      display: none;
+    }
+    .sticky-user.active { display: block; }
+    .sticky-user .label {
+      font-size: 10px; font-weight: 600;
+      color: var(--fg-muted);
+      text-transform: uppercase; letter-spacing: 0.06em;
+      margin-bottom: 6px;
+    }
+    .sticky-user .bubble {
+      max-width: 100%;
+      padding: 8px 12px;
+      border-radius: 14px;
+      background: var(--accent);
+      color: white;
+      font-size: 14px;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+
+    /* ─── Chat view ──────────────────────────────────────────── */
+    .view {
+      display: none;
+      flex: 1; min-height: 0; flex-direction: column;
+      overflow: hidden;
+    }
+    .view.active { display: flex; }
+
+    .chat-stream {
+      flex: 1; overflow-y: auto;
+      padding: 14px 12px 8px;
+      scroll-behavior: smooth;
+      -webkit-overflow-scrolling: touch;
+      position: relative;
+    }
+    .chat-stream-empty {
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      height: 100%; padding: 32px 24px;
+      color: var(--fg-muted); font-size: 13px;
+      text-align: center;
+    }
+    .chat-stream-empty .icon { font-size: 56px; opacity: 0.35; margin-bottom: 16px; }
+
+    .message { display: flex; gap: 8px; margin-bottom: 14px; animation: msg-in 0.25s cubic-bezier(.2,.7,.3,1); }
+    @keyframes msg-in {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .message.user { flex-direction: row-reverse; }
+    .bubble {
+      max-width: 78%;
+      padding: 10px 14px;
+      border-radius: var(--radius-lg);
+      background: var(--bg-elev);
+      box-shadow: var(--shadow-sm);
+      word-break: break-word;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+      position: relative;
+    }
+    .message.user .bubble {
+      background: var(--accent);
+      color: white;
+      border-bottom-right-radius: 6px;
+    }
+    .message.agent .bubble { border-bottom-left-radius: 6px; }
+    .bubble .author {
+      font-size: 11px; font-weight: 600;
+      opacity: 0.65; margin-bottom: 4px;
+      text-transform: uppercase; letter-spacing: 0.04em;
+    }
+    .bubble .body p { margin-bottom: 8px; }
+    .bubble .body p:last-child { margin-bottom: 0; }
+    .bubble code {
+      background: rgba(0, 0, 0, 0.32);
+      padding: 1px 5px; border-radius: 4px;
+      font: 12.5px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    }
+    .bubble pre {
+      background: rgba(0, 0, 0, 0.36);
+      padding: 10px 12px; border-radius: 8px;
+      font: 12px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      overflow-x: auto; margin: 8px 0;
+    }
+    .bubble pre code { background: none; padding: 0; }
+    .bubble h1, .bubble h2, .bubble h3 { margin: 10px 0 6px; font-weight: 700; line-height: 1.25; }
+    .bubble h1 { font-size: 18px; } .bubble h2 { font-size: 16px; } .bubble h3 { font-size: 14px; }
+    .bubble ul, .bubble ol { padding-left: 22px; margin: 6px 0; }
+    .bubble li { margin: 2px 0; }
+    .bubble a { color: var(--accent); text-decoration: underline; }
+    .bubble strong { font-weight: 700; }
+    .bubble em { font-style: italic; }
+
+    .caret {
+      display: inline-block;
+      width: 7px; height: 1em;
+      background: var(--fg);
+      margin-left: 2px; vertical-align: text-bottom;
+      animation: caret-blink 1s steps(2) infinite;
+    }
+    @keyframes caret-blink {
+      0%, 50% { opacity: 1; }
+      51%, 100% { opacity: 0; }
+    }
+
+    /* Tool pill — active state pulses, complete state solid */
+    .tool-pill {
+      display: inline-flex; align-items: center; gap: 8px;
+      max-width: 84%;
+      margin: 0 0 8px 36px;
+      padding: 6px 12px 6px 10px;
+      background: rgba(46, 166, 218, 0.10);
+      border: 1px solid rgba(46, 166, 218, 0.32);
+      border-radius: 999px;
+      font-size: 12px;
+      color: var(--accent);
+      backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+      transition: background 0.3s, border-color 0.3s, opacity 0.3s;
+      animation: pill-pulse 1.4s ease-in-out infinite;
+    }
+    @keyframes pill-pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(46, 166, 218, 0.25); }
+      50% { box-shadow: 0 0 0 4px rgba(46, 166, 218, 0); }
+    }
+    .tool-pill.complete {
+      animation: none; opacity: 0.6;
+      background: rgba(67, 160, 71, 0.10);
+      border-color: rgba(67, 160, 71, 0.32);
+      color: var(--ok);
+    }
+    .tool-pill.observation {
+      background: rgba(255, 152, 0, 0.10);
+      border-color: rgba(255, 152, 0, 0.32);
+      color: var(--warning);
+    }
+    .tool-pill.complete.observation {
+      background: rgba(67, 160, 71, 0.10);
+      border-color: rgba(67, 160, 71, 0.32);
+      color: var(--ok);
+    }
+    .tool-pill .dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: currentColor;
+    }
+    .tool-pill .label { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+    .tool-pill .elapsed { opacity: 0.65; font-size: 11px; margin-left: 4px; }
+    .tool-pill.observation .icon { font-size: 14px; }
+
+    /* Vision indicator — capture result preview in chat */
+    .vision {
+      display: flex; flex-direction: column; gap: 8px;
+      max-width: 84%;
+      margin: 0 0 12px 36px;
+      padding: 10px 12px;
+      background: rgba(255, 152, 0, 0.10);
+      border: 1px solid rgba(255, 152, 0, 0.32);
+      border-radius: 12px;
+      font-size: 13px;
+      color: var(--warning);
+      backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    }
+    .vision .head { display: flex; align-items: center; gap: 8px; }
+    .vision .eye { font-size: 18px; }
+    .vision img {
+      width: 100%; max-width: 280px;
+      border-radius: 8px;
+      cursor: zoom-in;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    /* ─── Composer ──────────────────────────────────────────── */
+    .composer {
+      padding: 10px 12px;
+      background: var(--glass-bg);
+      backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+      border-top: 1px solid var(--glass-border);
+      display: flex; gap: 8px; align-items: flex-end;
+      padding-bottom: max(10px, env(safe-area-inset-bottom));
+    }
+    .composer textarea {
+      flex: 1;
+      min-height: 40px; max-height: 120px;
+      padding: 10px 14px;
+      background: var(--bg-elev);
+      color: var(--fg);
+      border: 1px solid var(--glass-border);
+      border-radius: 20px;
+      font: inherit;
+      resize: none;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    .composer textarea:focus { border-color: var(--accent); }
+    .composer textarea::placeholder { color: var(--fg-muted); }
+    .send-btn {
+      width: 44px; height: 44px;
+      background: var(--accent); color: white;
+      border: 0; border-radius: 50%;
+      font-size: 20px;
+      cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      flex: 0 0 auto;
+      transition: opacity 0.2s, transform 0.1s;
+    }
+    .send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .send-btn:active:not(:disabled) { transform: scale(0.92); }
+
+    /* ─── Actions view (split: controls | display) ───────────── */
+    .actions-view {
+      flex: 1; overflow-y: auto;
+      padding: 16px 12px;
+      display: flex; flex-direction: column; gap: 16px;
+    }
+    .controls-block,
+    .display-block {
+      background: var(--glass-bg);
+      backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+      border: 1px solid var(--glass-border);
+      border-radius: var(--radius-md);
+      padding: 14px;
+    }
+    .block-title {
+      font-size: 11px; font-weight: 700;
+      color: var(--fg-muted);
+      text-transform: uppercase; letter-spacing: 0.06em;
+      margin-bottom: 10px;
+    }
+    .primary-action {
+      width: 100%;
+      padding: 14px 16px;
+      background: var(--accent); color: white;
+      border: 0; border-radius: 10px;
+      font-size: 15px; font-weight: 600;
+      cursor: pointer;
+      display: flex; align-items: center; justify-content: center; gap: 8px;
+      transition: transform 0.1s, opacity 0.2s;
+    }
+    .primary-action:active { transform: scale(0.98); }
+    .primary-action:disabled { opacity: 0.5; cursor: not-allowed; }
+    .primary-action.busy { opacity: 0.6; cursor: wait; }
+
+    .tabs-list { display: flex; flex-direction: column; gap: 6px; margin-top: 14px; }
+    .tab-item {
+      display: flex; align-items: center; gap: 10px;
+      padding: 8px 10px;
+      background: var(--bg-elev);
+      border-radius: 8px;
+      font-size: 13px;
+      transition: border-color 0.15s;
+    }
+    .tab-item.active { border: 1px solid var(--accent); }
+    .tab-item .favicon {
+      width: 16px; height: 16px;
+      border-radius: 4px;
+      flex: 0 0 auto;
+      background: var(--bg);
+    }
+    .tab-item .title {
+      flex: 1; min-width: 0;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .tab-item .url {
+      font-size: 11px; color: var(--fg-muted);
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 60%;
+    }
+    .tab-item .badge {
+      font-size: 10px; padding: 2px 7px;
+      background: var(--accent); color: white;
+      border-radius: 999px;
+      text-transform: uppercase;
+    }
+    .tab-item .capture-icon {
+      width: 30px; height: 30px;
+      background: transparent;
+      border: 1px solid var(--glass-border);
+      border-radius: 50%;
+      color: var(--fg);
+      font-size: 14px;
+      cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      flex: 0 0 auto;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .tab-item .capture-icon:hover:not(:disabled) {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+    .tab-item .capture-icon:disabled { opacity: 0.35; cursor: wait; }
+
+    .display-empty {
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      padding: 28px 12px;
+      color: var(--fg-muted); font-size: 13px;
+      text-align: center;
+    }
+    .display-empty .icon { font-size: 44px; opacity: 0.35; margin-bottom: 10px; }
+
+    .preview-wrap {
+      display: flex; flex-direction: column; gap: 10px;
+    }
+    .preview-meta {
+      display: flex; align-items: center; gap: 8px;
+      font-size: 12px; color: var(--fg-muted);
+    }
+    .preview-meta .badge {
+      padding: 2px 8px;
+      background: rgba(46, 166, 218, 0.15);
+      color: var(--accent);
+      border-radius: 999px;
+      font-size: 11px;
+    }
+    .preview-img {
+      width: 100%;
+      border-radius: 10px;
+      cursor: zoom-in;
+      border: 1px solid var(--glass-border);
+      box-shadow: var(--shadow-sm);
+      transition: transform 0.1s;
+    }
+    .preview-img:active { transform: scale(0.99); }
+
+    .empty-hint {
+      color: var(--fg-muted); font-size: 12.5px;
+      padding: 12px; text-align: center;
+    }
+    .error-hint { color: var(--danger); font-size: 12.5px; padding: 8px 0; }
+
+    /* ─── Image zoom modal ───────────────────────────────────── */
+    .zoom {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.88);
+      backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+      display: none;
+      align-items: center; justify-content: center;
+      padding: 24px; z-index: 100;
+      cursor: zoom-out;
+    }
+    .zoom.active { display: flex; }
+    .zoom img { max-width: 100%; max-height: 100%; border-radius: 8px; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <span class="title">Cebian</span>
+      <span class="status-pill" id="status-pill">
+        <span class="status-dot"></span>
+        <span id="status-text">Connecting…</span>
+      </span>
+    </header>
+
+    <nav class="tabs">
+      <div class="tab-group">
+        <button class="tab-btn active" data-tab="chat">Chat</button>
+        <button class="tab-btn" data-tab="actions">Actions</button>
+      </div>
+      <button class="new-chat-btn" id="new-chat-btn" aria-label="New chat" disabled>+</button>
+    </nav>
+
+    <!-- Observation banner — appears whenever an observation tool is active -->
+    <div class="banner" id="obs-banner">
+      <span class="eye" id="obs-eye">👁️</span>
+      <span class="pulse-dot"></span>
+      <span class="text" id="obs-text">Agent đang quan sát tab Chrome…</span>
+      <span class="count" id="obs-count">1</span>
+    </div>
+
+    <!-- Sticky user message — pins the current question at top while agent streams below -->
+    <div class="sticky-user" id="sticky-user">
+      <div class="label">Your question</div>
+      <div class="bubble" id="sticky-user-bubble"></div>
+    </div>
+
+    <!-- Chat view -->
+    <div class="view active" id="view-chat">
+      <div class="chat-stream" id="chat-stream">
+        <div class="chat-stream-empty" id="chat-empty">
+          <div class="icon">💬</div>
+          <div>Ask cebian anything.</div>
+          <div style="margin-top:6px;opacity:0.7">Or capture a tab to share vision context.</div>
+        </div>
+      </div>
+      <div class="composer">
+        <textarea id="prompt-input" placeholder="Message cebian…" rows="1"></textarea>
+        <button class="send-btn" id="send-btn" disabled aria-label="Send">↑</button>
+      </div>
+    </div>
+
+    <!-- Actions view (split: controls top | display bottom) -->
+    <div class="view" id="view-actions">
+      <div class="actions-view">
+        <div class="controls-block">
+          <div class="block-title">Controls</div>
+          <button class="primary-action" id="btn-capture">
+            <span>📸</span> Capture active tab
+          </button>
+          <div class="tabs-list" id="tabs-list"></div>
+        </div>
+        <div class="display-block">
+          <div class="block-title">Preview</div>
+          <div id="display-body">
+            <div class="display-empty">
+              <div class="icon">🖼️</div>
+              <div>No screenshot yet.</div>
+              <div style="margin-top:4px;opacity:0.7">Tap the capture button above.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Full-screen image zoom -->
+  <div class="zoom" id="zoom">
+    <img id="zoom-img" alt="Captured tab zoom">
+  </div>
+
+  <script>
+    'use strict';
+
+    // ───────────────────────────────────────────────────────────
+    // Telegram WebApp SDK init
+    // ───────────────────────────────────────────────────────────
+    const tg = window.Telegram && window.Telegram.WebApp;
+    if (tg) {
+      try { tg.ready(); } catch (e) {}
+      try { tg.expand(); } catch (e) {}
+      try { tg.BackButton && tg.BackButton.hide(); } catch (e) {}
+    }
+
+    function applyTheme() {
+      if (!tg || !tg.themeParams) return;
+      const root = document.documentElement;
+      const map = {
+        '--bg': 'bg_color',
+        '--bg-elev': 'secondary_bg_color',
+        '--fg': 'text_color',
+        '--fg-muted': 'hint_color',
+        '--accent': 'button_color',
+      };
+      for (const [css, tgKey] of Object.entries(map)) {
+        const v = tg.themeParams[tgKey];
+        if (v) root.style.setProperty(css, v);
+      }
+      if (tg.colorScheme === 'light') root.dataset.theme = 'light';
+      else delete root.dataset.theme;
+    }
+    applyTheme();
+    if (tg && tg.onEvent) tg.onEvent('themeChanged', applyTheme);
+
+    const initData = (tg && tg.initData) || '';
+    const wsScheme = location.protocol === 'https:' ? 'wss' : 'ws';
+    const wsUrl = `${wsScheme}://${location.host}/ws?type=webapp&initData=${encodeURIComponent(initData)}`;
+
+    // ───────────────────────────────────────────────────────────
+    // Haptic feedback
+    // ───────────────────────────────────────────────────────────
+    const haptic = {
+      tap(kind = 'light') { try { tg && tg.HapticFeedback && tg.HapticFeedback.impactOccurred(kind); } catch (e) {} },
+      select() { try { tg && tg.HapticFeedback && tg.HapticFeedback.selectionChanged(); } catch (e) {} },
+      notify(kind = 'success') { try { tg && tg.HapticFeedback && tg.HapticFeedback.notificationOccurred(kind); } catch (e) {} },
+    };
+
+    // ───────────────────────────────────────────────────────────
+    // DOM refs
+    // ───────────────────────────────────────────────────────────
+    const statusPill = document.getElementById('status-pill');
+    const statusText = document.getElementById('status-text');
+    const obsBanner = document.getElementById('obs-banner');
+    const obsEye = document.getElementById('obs-eye');
+    const obsText = document.getElementById('obs-text');
+    const obsCount = document.getElementById('obs-count');
+    const stickyUser = document.getElementById('sticky-user');
+    const stickyUserBubble = document.getElementById('sticky-user-bubble');
+    const chatStream = document.getElementById('chat-stream');
+    const chatEmpty = document.getElementById('chat-empty');
+    const promptInput = document.getElementById('prompt-input');
+    const sendBtn = document.getElementById('send-btn');
+    const newChatBtn = document.getElementById('new-chat-btn');
+    const btnCapture = document.getElementById('btn-capture');
+    const tabsList = document.getElementById('tabs-list');
+    const displayBody = document.getElementById('display-body');
+    const zoomModal = document.getElementById('zoom');
+    const zoomImg = document.getElementById('zoom-img');
+
+    // ───────────────────────────────────────────────────────────
+    // Tabs
+    // ───────────────────────────────────────────────────────────
+    document.querySelectorAll('.tab-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const target = btn.dataset.tab;
+        document.querySelectorAll('.tab-btn').forEach((b) => b.classList.toggle('active', b === btn));
+        document.querySelectorAll('.view').forEach((v) => v.classList.toggle('active', v.id === `view-${target}`));
+        haptic.select();
+      });
+    });
+
+    // ───────────────────────────────────────────────────────────
+    // WS lifecycle
+    // ───────────────────────────────────────────────────────────
+    let ws = null;
+    let reconnectDelay = 1000;
+    let wsConnected = false;
+
+    function setStatus(online) {
+      wsConnected = !!online;
+      statusPill.classList.toggle('online', !!online);
+      statusPill.classList.toggle('offline', !online);
+      statusText.textContent = online ? 'Online' : 'Offline';
+      sendBtn.disabled = !promptInput.value.trim() || !online;
+      btnCapture.disabled = !online;
+      newChatBtn.disabled = !online;
+      refreshTabsButtons();
+    }
+
+    function connect() {
+      try { ws = new WebSocket(wsUrl); }
+      catch (err) { console.warn('[mini-app] WS constructor failed:', err); scheduleReconnect(); return; }
+
+      ws.addEventListener('open', () => {
+        reconnectDelay = 1000;
+      });
+      ws.addEventListener('message', (ev) => {
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch (err) { return; }
+        handleMessage(msg);
+      });
+      ws.addEventListener('close', () => {
+        setStatus(false);
+        scheduleReconnect();
+      });
+      ws.addEventListener('error', () => {});
+    }
+    function scheduleReconnect() {
+      setTimeout(connect, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+    }
+
+    // ───────────────────────────────────────────────────────────
+    // Smart scroll
+    // ───────────────────────────────────────────────────────────
+    function smartScroll() {
+      const slack = chatStream.scrollHeight - chatStream.scrollTop - chatStream.clientHeight;
+      if (slack < 200) chatStream.scrollTop = chatStream.scrollHeight;
+    }
+
+    // ───────────────────────────────────────────────────────────
+    // Tool-name observation classifier — drives the "👁️ observing" banner
+    // ───────────────────────────────────────────────────────────
+    const OBSERVATION_KEYWORDS = [
+      'read_page', 'crawl', 'inspect', 'navigate', 'snapshot', 'capture', 'screenshot',
+    ];
+    function isObservationTool(name) {
+      const lower = String(name || '').toLowerCase();
+      return OBSERVATION_KEYWORDS.some((k) => lower.includes(k));
+    }
+
+    // ───────────────────────────────────────────────────────────
+    // Observation banner + tool pill state
+    // ───────────────────────────────────────────────────────────
+    /** Map<tool_name, { pill, observation, startedAt }>. */
+    const toolStateByName = new Map();
+    let activeToolCount = 0;
+    let activeObservationCount = 0;
+    /** True between "user hit send" and "final reply arrived" — drives the
+     *  fallback banner so the user never stares at a blank screen during
+     *  the LLM's thinking window before the first tool event fires. */
+    let pendingAnalysis = false;
+
+    function recomputeObsBanner() {
+      if (activeObservationCount > 0) {
+        obsBanner.classList.add('active');
+        obsEye.textContent = '👁️';
+        obsText.textContent = 'Agent đang quan sát tab Chrome…';
+      } else if (activeToolCount > 0) {
+        obsBanner.classList.add('active');
+        obsEye.textContent = '⚙️';
+        obsText.textContent = 'Agent đang xử lý…';
+      } else if (pendingAnalysis) {
+        // Fallback: user vừa bấm gửi, LLM 还没 call 第一个 tool —— 也给个
+        // 反馈，不要让 banner 区域空白。
+        obsBanner.classList.add('active');
+        obsEye.textContent = '👁️';
+        obsText.textContent = 'Agent đang phân tích tin nhắn…';
+      } else {
+        obsBanner.classList.remove('active');
+      }
+      obsCount.textContent = activeToolCount > 0 ? String(activeToolCount) : '…';
+    }
+
+    function startToolPill(toolName, label) {
+      // End any in-flight pill with the same name first (defensive).
+      const prev = toolStateByName.get(toolName);
+      if (prev) endToolPill(toolName, undefined);
+
+      const observation = isObservationTool(toolName);
+      const pill = document.createElement('div');
+      pill.className = 'tool-pill' + (observation ? ' observation' : '');
+      pill.dataset.toolName = toolName;
+      const icon = document.createElement('span');
+      icon.className = 'icon';
+      icon.textContent = observation ? '👁️' : '⚙️';
+      pill.appendChild(icon);
+      const dot = document.createElement('span');
+      dot.className = 'dot';
+      pill.appendChild(dot);
+      const lbl = document.createElement('span');
+      lbl.className = 'label';
+      lbl.textContent = label || toolName;
+      pill.appendChild(lbl);
+      chatStream.appendChild(pill);
+      smartScroll();
+
+      toolStateByName.set(toolName, { pill, observation, startedAt: Date.now() });
+      activeToolCount += 1;
+      if (observation) activeObservationCount += 1;
+      recomputeObsBanner();
+    }
+    function endToolPill(toolName, elapsed_ms) {
+      const state = toolStateByName.get(toolName);
+      if (!state) return;
+      state.pill.classList.add('complete');
+      state.pill.classList.remove('observation'); // collapsed to neutral "complete" style
+      if (typeof elapsed_ms === 'number' && elapsed_ms > 0) {
+        const e = document.createElement('span');
+        e.className = 'elapsed';
+        e.textContent = `${(elapsed_ms / 1000).toFixed(1)}s`;
+        state.pill.appendChild(e);
+      }
+      toolStateByName.delete(toolName);
+      activeToolCount = Math.max(0, activeToolCount - 1);
+      if (state.observation) activeObservationCount = Math.max(0, activeObservationCount - 1);
+      recomputeObsBanner();
+    }
+
+    // ───────────────────────────────────────────────────────────
+    // Chat message rendering
+    // ───────────────────────────────────────────────────────────
+    function clearEmpty() {
+      if (chatEmpty && chatEmpty.parentNode) chatEmpty.remove();
+    }
+    function appendMessage(role, text) {
+      clearEmpty();
+      const wrap = document.createElement('div');
+      wrap.className = `message ${role}`;
+      const bubble = document.createElement('div');
+      bubble.className = 'bubble';
+      if (role === 'agent') {
+        const author = document.createElement('div');
+        author.className = 'author';
+        author.textContent = 'Cebian';
+        bubble.appendChild(author);
+      }
+      const body = document.createElement('div');
+      body.className = 'body';
+      body.innerHTML = renderMarkdown(text);
+      bubble.appendChild(body);
+      wrap.appendChild(bubble);
+      chatStream.appendChild(wrap);
+      smartScroll();
+      return wrap;
+    }
+    function startStreamingAssistant() {
+      clearEmpty();
+      const wrap = document.createElement('div');
+      wrap.className = 'message agent';
+      const bubble = document.createElement('div');
+      bubble.className = 'bubble';
+      const author = document.createElement('div');
+      author.className = 'author';
+      author.textContent = 'Cebian';
+      bubble.appendChild(author);
+      const body = document.createElement('div');
+      body.className = 'body';
+      const text = document.createElement('span');
+      body.appendChild(text);
+      const caret = document.createElement('span');
+      caret.className = 'caret';
+      body.appendChild(caret);
+      bubble.appendChild(body);
+      wrap.appendChild(bubble);
+      chatStream.appendChild(wrap);
+      smartScroll();
+      return {
+        feed(delta) { text.textContent += delta; smartScroll(); },
+        finalize(fullText) { body.innerHTML = renderMarkdown(fullText); smartScroll(); },
+        error(message) {
+          body.innerHTML = `<span style="color:var(--danger)">⚠ ${escapeHtml(message)}</span>`;
+          smartScroll();
+        },
+      };
+    }
+
+    // Vision indicator — inline screenshot in chat
+    function showVisionIndicator(message, dataUrl) {
+      const wrap = document.createElement('div');
+      wrap.className = 'vision';
+      const head = document.createElement('div');
+      head.className = 'head';
+      const eye = document.createElement('span');
+      eye.className = 'eye';
+      eye.textContent = '👁️';
+      const m = document.createElement('span');
+      m.textContent = message;
+      head.appendChild(eye);
+      head.appendChild(m);
+      wrap.appendChild(head);
+      if (dataUrl) {
+        const img = document.createElement('img');
+        img.src = dataUrl;
+        img.alt = 'Tab screenshot';
+        img.addEventListener('click', () => {
+          zoomImg.src = dataUrl;
+          zoomModal.classList.add('active');
+          haptic.tap();
+        });
+        wrap.appendChild(img);
+      }
+      chatStream.appendChild(wrap);
+      smartScroll();
+    }
+
+    // ───────────────────────────────────────────────────────────
+    // Sticky user question
+    // ───────────────────────────────────────────────────────────
+    function setStickyUser(text) {
+      if (!text) {
+        stickyUser.classList.remove('active');
+        stickyUserBubble.textContent = '';
+      } else {
+        stickyUserBubble.textContent = text;
+        stickyUser.classList.add('active');
+      }
+    }
+
+    // ───────────────────────────────────────────────────────────
+    // Chat clear (New Chat button)
+    // ───────────────────────────────────────────────────────────
+    function clearChat() {
+      // Remove all messages but keep the empty-state placeholder until first send.
+      while (chatStream.firstChild) chatStream.removeChild(chatStream.firstChild);
+      const empty = document.createElement('div');
+      empty.className = 'chat-stream-empty';
+      empty.id = 'chat-empty';
+      empty.innerHTML =
+        '<div class="icon">💬</div>' +
+        '<div>Ask cebian anything.</div>' +
+        '<div style="margin-top:6px;opacity:0.7">Or capture a tab to share vision context.</div>';
+      chatStream.appendChild(empty);
+      // Clear sticky user
+      setStickyUser('');
+      // Clear tool pill state + banner
+      for (const name of [...toolStateByName.keys()]) endToolPill(name, undefined);
+      activeToolCount = 0;
+      activeObservationCount = 0;
+      recomputeObsBanner();
+      // Reset scroll
+      chatStream.scrollTop = 0;
+    }
+
+    // ───────────────────────────────────────────────────────────
+    // WS action dispatcher
+    // ───────────────────────────────────────────────────────────
+    const pendingRequests = new Map();
+
+    function sendAction(action, render) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        render({ ok: false, error: 'Extension offline' });
+        return;
+      }
+      const request_id = (crypto.randomUUID && crypto.randomUUID()) ||
+        `req-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+      pendingRequests.set(request_id, render);
+      ws.send(JSON.stringify({ kind: 'webapp_action', request_id, action }));
+    }
+
+    function handleMessage(msg) {
+      if (!msg || typeof msg.kind !== 'string') return;
+
+      if (msg.kind === 'extension_status') {
+        setStatus(msg.online === true);
+        return;
+      }
+
+      if (msg.kind === 'webapp_action_result') {
+        const pending = pendingRequests.get(msg.request_id);
+        if (pending) pending(msg);
+        if (msg.partial !== true) pendingRequests.delete(msg.request_id);
+        return;
+      }
+
+      if (msg.kind === 'webapp_tool_event') {
+        if (msg.phase === 'start') {
+          startToolPill(msg.tool_name, msg.label || msg.tool_name);
+        } else {
+          endToolPill(msg.tool_name, msg.elapsed_ms);
+        }
+        return;
+      }
+    }
+
+    // ───────────────────────────────────────────────────────────
+    // Mini Markdown parser (escapes HTML first, then block + inline formatting)
+    // ───────────────────────────────────────────────────────────
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, (c) => (
+        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+      ));
+    }
+    function renderMarkdown(text) {
+      const blocks = String(text).split(/\n{2,}/);
+      return blocks.map((block) => {
+        if (/^```/.test(block)) {
+          const inner = block.replace(/^```[a-zA-Z0-9_-]*\n?/, '').replace(/```$/m, '');
+          return `<pre><code>${escapeHtml(inner)}</code></pre>`;
+        }
+        const heading = block.match(/^(#{1,3})\s+(.+?)\s*$/m);
+        if (heading && block.trim().split('\n').length === 1) {
+          const lvl = heading[1].length;
+          return `<h${lvl}>${inlineFormat(heading[2])}</h${lvl}>`;
+        }
+        if (/^\s*(?:[-*]|\d+\.)\s+/m.test(block)) {
+          const lines = block.split('\n').filter((l) => /^\s*(?:[-*]|\d+\.)\s+/.test(l));
+          const ordered = /^\s*\d+\.\s+/.test(lines[0]);
+          const tag = ordered ? 'ol' : 'ul';
+          const items = lines
+            .map((l) => l.replace(/^\s*(?:[-*]|\d+\.)\s+/, ''))
+            .map((c) => `<li>${inlineFormat(c)}</li>`)
+            .join('');
+          return `<${tag}>${items}</${tag}>`;
+        }
+        return `<p>${inlineFormat(block)}</p>`;
+      }).join('');
+    }
+    function inlineFormat(s) {
+      const escaped = escapeHtml(s);
+      return escaped
+        .replace(/\*\*([^*\n]+?)\*\*/g, '<strong>$1</strong>')
+        .replace(/\*([^*\n]+?)\*/g, '<em>$1</em>')
+        .replace(/_([^_\n]+?)_/g, '<em>$1</em>')
+        .replace(/`([^`\n]+?)`/g, '<code>$1</code>')
+        .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
+          '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    }
+
+    // ───────────────────────────────────────────────────────────
+    // Actions: Capture (primary button + per-tab icon in list)
+    // ───────────────────────────────────────────────────────────
+    let lastPreviewDataUrl = null;
+
+    function renderPreviewImage(dataUrl, tabTitle) {
+      displayBody.innerHTML = '';
+      const wrap = document.createElement('div');
+      wrap.className = 'preview-wrap';
+      const meta = document.createElement('div');
+      meta.className = 'preview-meta';
+      const badge = document.createElement('span');
+      badge.className = 'badge';
+      badge.textContent = 'Captured';
+      meta.appendChild(badge);
+      if (tabTitle) {
+        const t = document.createElement('span');
+        t.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+        t.textContent = tabTitle;
+        meta.appendChild(t);
+      }
+      wrap.appendChild(meta);
+      const img = document.createElement('img');
+      img.className = 'preview-img';
+      img.src = dataUrl;
+      img.alt = 'Captured tab';
+      img.addEventListener('click', () => {
+        zoomImg.src = dataUrl;
+        zoomModal.classList.add('active');
+        haptic.tap();
+      });
+      wrap.appendChild(img);
+      displayBody.appendChild(wrap);
+      lastPreviewDataUrl = dataUrl;
+    }
+
+    function captureTab(tabId) {
+      const action = { kind: 'capture_tab', format: 'jpeg', quality: 60 };
+      if (typeof tabId === 'number') action.tabId = tabId;
+      btnCapture.classList.add('busy');
+      btnCapture.disabled = true;
+      refreshTabsButtons();
+      sendAction(action, (result) => {
+        btnCapture.classList.remove('busy');
+        btnCapture.disabled = !wsConnected;
+        refreshTabsButtons();
+        if (!result.ok) {
+          haptic.notify('error');
+          displayBody.innerHTML = '';
+          const err = document.createElement('div');
+          err.className = 'error-hint';
+          err.textContent = `⚠ ${result.error || 'capture failed'}`;
+          displayBody.appendChild(err);
+          return;
+        }
+        haptic.notify('success');
+        const dataUrl = result.data && result.data.dataUrl;
+        if (!dataUrl) {
+          displayBody.innerHTML = '<div class="empty-hint">No screenshot received.</div>';
+          return;
+        }
+        const tabs = cachedTabs;
+        const matchedTab = tabId != null ? tabs.find((t) => t.id === tabId) : tabs.find((t) => t.active);
+        const title = matchedTab ? matchedTab.title : null;
+        renderPreviewImage(dataUrl, title);
+        // Surface in chat stream too (with sticky user visibility)
+        showVisionIndicator(tabId != null ? `📸 Captured tab "${title || tabId}"` : '📸 Captured active tab', dataUrl);
+      });
+    }
+
+    btnCapture.addEventListener('click', () => {
+      haptic.tap('medium');
+      captureTab(undefined); // active tab
+    });
+
+    // ───────────────────────────────────────────────────────────
+    // Actions: List tabs (with per-tab capture icon)
+    // ───────────────────────────────────────────────────────────
+    let cachedTabs = [];
+
+    function refreshTabsButtons() {
+      const listBusy = listTabsCard.classList.contains('busy');
+      tabsList.querySelectorAll('.tab-item .capture-icon').forEach((b) => {
+        b.disabled = !wsConnected || btnCapture.classList.contains('busy') || listBusy;
+      });
+    }
+
+    const listTabsCard = document.getElementById('controls-block') || document.body; // fallback
+
+    function loadTabs() {
+      tabsList.innerHTML = '<div class="empty-hint">Loading…</div>';
+      sendAction({ kind: 'get_tabs' }, (result) => {
+        if (!result.ok) {
+          tabsList.innerHTML = `<div class="error-hint">⚠ ${escapeHtml(result.error || 'list failed')}</div>`;
+          return;
+        }
+        cachedTabs = (result.data && result.data.tabs) || [];
+        renderTabsList();
+      });
+    }
+
+    function renderTabsList() {
+      tabsList.innerHTML = '';
+      if (cachedTabs.length === 0) {
+        tabsList.innerHTML = '<div class="empty-hint">No tabs reported.</div>';
+        return;
+      }
+      for (const tab of cachedTabs) {
+        const item = document.createElement('div');
+        item.className = 'tab-item' + (tab.active ? ' active' : '');
+        if (tab.favIconUrl) {
+          const img = document.createElement('img');
+          img.className = 'favicon';
+          img.src = tab.favIconUrl;
+          img.alt = '';
+          img.referrerPolicy = 'no-referrer';
+          img.onerror = () => {
+            img.replaceWith(Object.assign(document.createElement('div'), {
+              className: 'favicon', textContent: '🌐',
+              style: 'display:flex;align-items:center;justify-content:center;font-size:12px;',
+            }));
+          };
+          item.appendChild(img);
+        } else {
+          const ph = document.createElement('div');
+          ph.className = 'favicon';
+          ph.textContent = '🌐';
+          ph.style.cssText = 'display:flex;align-items:center;justify-content:center;font-size:12px;';
+          item.appendChild(ph);
+        }
+        const text = document.createElement('div');
+        text.style.cssText = 'flex:1;min-width:0;overflow:hidden;';
+        const title = document.createElement('div');
+        title.className = 'title';
+        title.textContent = tab.title || '(untitled)';
+        title.title = tab.url || '';
+        text.appendChild(title);
+        if (tab.url) {
+          const url = document.createElement('div');
+          url.className = 'url';
+          url.textContent = (() => { try { return new URL(tab.url).host; } catch (e) { return tab.url; } })();
+          text.appendChild(url);
+        }
+        item.appendChild(text);
+        if (tab.active) {
+          const badge = document.createElement('span');
+          badge.className = 'badge';
+          badge.textContent = 'Active';
+          item.appendChild(badge);
+        }
+        // Per-tab capture icon
+        const capBtn = document.createElement('button');
+        capBtn.className = 'capture-icon';
+        capBtn.title = `Capture this tab`;
+        capBtn.textContent = '📸';
+        capBtn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          haptic.tap('medium');
+          captureTab(tab.id);
+        });
+        item.appendChild(capBtn);
+        // Click row → also capture this tab (convenience)
+        item.addEventListener('click', () => {
+          haptic.tap('light');
+          captureTab(tab.id);
+        });
+        item.style.cursor = 'pointer';
+        tabsList.appendChild(item);
+      }
+      refreshTabsButtons();
+    }
+
+    // ───────────────────────────────────────────────────────────
+    // Composer
+    // ───────────────────────────────────────────────────────────
+    function autoSize() {
+      promptInput.style.height = 'auto';
+      promptInput.style.height = Math.min(promptInput.scrollHeight, 120) + 'px';
+    }
+    promptInput.addEventListener('input', () => {
+      autoSize();
+      sendBtn.disabled = !promptInput.value.trim() || !wsConnected;
+    });
+    promptInput.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) {
+        ev.preventDefault();
+        if (!sendBtn.disabled) sendBtn.click();
+      }
+    });
+
+    let activeAssistantStream = null;
+
+    sendBtn.addEventListener('click', () => {
+      const text = promptInput.value.trim();
+      if (!text) return;
+      haptic.tap('medium');
+
+      // 1. Pin user bubble to sticky header — **唯一的 user 消息渲染位置**。
+      //    不再 appendMessage('user', …) 到 chat-stream：stream 只装 agent
+      //    侧内容（streaming bubble / tool pill / vision indicator），
+      //    滚动历史时看到的是纯粹的回复时间线，原始 question 永远钉在顶上。
+      setStickyUser(text);
+      promptInput.value = '';
+      autoSize();
+      sendBtn.disabled = true;
+      newChatBtn.disabled = true;
+
+      // 2. Fallback banner —— 用户按下 send 的瞬间就点亮，不等第一个 tool
+      //    事件（LLM 思考窗口可能 2-5s，空白屏体验极差）。第一个 tool 事件
+      //    到达后 recomputeObsBanner 会把 banner 文案切换成具体的 tool 状态。
+      pendingAnalysis = true;
+      recomputeObsBanner();
+
+      // 3. Create streaming assistant bubble.
+      const stream = startStreamingAssistant();
+      activeAssistantStream = stream;
+
+      sendAction({ kind: 'prompt', text }, (result) => {
+        if (result.partial === true) {
+          const delta = (result.data && (result.data.delta || result.data.text)) || '';
+          if (delta) stream.feed(delta);
+          return;
+        }
+        // Final frame —— 无论 ok / error 都把 pendingAnalysis 熄掉。
+        pendingAnalysis = false;
+        if (!result.ok) {
+          haptic.notify('error');
+          stream.error(result.error || 'unknown error');
+          activeAssistantStream = null;
+          refreshChatButtons();
+          recomputeObsBanner();
+          return;
+        }
+        haptic.notify('success');
+        const finalText = (result.data && (result.data.text || result.data.reply)) || '';
+        stream.finalize(finalText);
+        activeAssistantStream = null;
+        refreshChatButtons();
+        recomputeObsBanner();
+      });
+    });
+
+    function refreshChatButtons() {
+      sendBtn.disabled = !promptInput.value.trim() || !wsConnected;
+      // New Chat button enabled when connected AND no active assistant stream in flight
+      newChatBtn.disabled = !wsConnected || activeAssistantStream != null;
+    }
+
+    // ───────────────────────────────────────────────────────────
+    // New Chat button
+    // ───────────────────────────────────────────────────────────
+    newChatBtn.addEventListener('click', () => {
+      if (newChatBtn.disabled) return;
+      haptic.tap('medium');
+      newChatBtn.classList.add('spinning');
+      newChatBtn.disabled = true;
+      sendAction({ kind: 'new_session' }, (result) => {
+        newChatBtn.classList.remove('spinning');
+        refreshChatButtons();
+        if (!result.ok) {
+          haptic.notify('error');
+          // Surface error in chat (toast would be nicer but keep simple here)
+          const err = document.createElement('div');
+          err.className = 'error-hint';
+          err.textContent = `⚠ New chat failed: ${result.error || 'unknown'}`;
+          chatStream.appendChild(err);
+          smartScroll();
+          return;
+        }
+        haptic.notify('success');
+        clearChat();
+        setStickyUser('');
+        // Reset pending flag — new session means no in-flight analysis.
+        pendingAnalysis = false;
+        recomputeObsBanner();
+      });
+    });
+
+    // ───────────────────────────────────────────────────────────
+    // Image zoom close
+    // ───────────────────────────────────────────────────────────
+    zoomModal.addEventListener('click', () => {
+      zoomModal.classList.remove('active');
+      haptic.tap('light');
+    });
+
+    // ───────────────────────────────────────────────────────────
+    // Boot
+    // ───────────────────────────────────────────────────────────
+    setStatus(false);
+    connect();
+    // Auto-load tabs in background so Actions view has data when user switches.
+    setTimeout(() => { if (wsConnected) loadTabs(); }, 800);
+    // Also poll periodically to keep tabs list fresh.
+    setInterval(() => { if (wsConnected) loadTabs(); }, 30000);
+  </script>
+</body>
+</html>
