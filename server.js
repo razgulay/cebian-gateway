@@ -69,6 +69,7 @@ async function callSendMessage(chatId, text, extra = {}) {
     if (extra.reply_to_message_id) body.reply_to_message_id = extra.reply_to_message_id;
     if (extra.disable_notification) body.disable_notification = true;
     if (extra.disable_link_preview) body.link_preview_options = { is_disabled: true };
+    if (extra.reply_markup) body.reply_markup = extra.reply_markup;
     const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -112,10 +113,11 @@ async function callSendChatAction(chatId, action) {
 /** editMessageText — block streaming (plain) + lần cuối (Markdown).
  *  'message is not modified' (nội dung không đổi giữa 2 lần edit liên tiếp)
  *  → nuốt, coi như ok — không phải lỗi với caller. */
-async function callEditMessage(chatId, messageId, text, parseMode) {
+async function callEditMessage(chatId, messageId, text, parseMode, replyMarkup) {
   try {
     const body = { chat_id: chatId, message_id: messageId, text };
     if (parseMode) body.parse_mode = parseMode;
+    if (replyMarkup) body.reply_markup = replyMarkup;
     const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageText`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -188,6 +190,89 @@ async function callDeleteMessage(chatId, messageId) {
   }
 }
 
+/** reply_markup tường minh để XOÁ inline keyboard (editMessageText với
+ *  empty inline_keyboard là cách remove per Bot API docs — không dựa vào
+ *  hành vi omit-mặc định). */
+const CLEAR_KEYBOARD = { inline_keyboard: [] };
+
+/** answerCallbackQuery — CHỈ gateway gọi (Telegram reject answer lần 2 trên
+ *  cùng callback_query_id; extension không bao giờ answer — mọi feedback của
+ *  extension đi qua editMessage). */
+async function callAnswerCallbackQuery(callbackQueryId, text) {
+  try {
+    const body = { callback_query_id: callbackQueryId };
+    if (text) body.text = text;
+    const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const json = await res.json().catch(() => ({}));
+    if (json.ok) return { ok: true };
+    return {
+      ok: false,
+      error: json.description ? `${res.status}: ${json.description}` : `status ${res.status}`,
+    };
+  } catch (err) {
+    return { ok: false, error: `telegram api unreachable: ${String(err)}` };
+  }
+}
+
+/** sendPhoto — multipart upload (Telegram không nhận base64 data-URL qua
+ *  JSON). Node 20+ native FormData/Blob — zero dependency. */
+async function callSendPhoto(chatId, imageBase64, caption) {
+  try {
+    const buf = Buffer.from(imageBase64, 'base64');
+    const form = new FormData();
+    form.append('chat_id', String(chatId));
+    form.append('photo', new Blob([buf], { type: 'image/jpeg' }), 'capture.jpg');
+    if (caption) form.append('caption', caption);
+    const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`, {
+      method: 'POST',
+      body: form,
+    });
+    const json = await res.json().catch(() => ({}));
+    if (json.ok && Array.isArray(json.result?.photo) && json.result.photo.length > 0) {
+      return { ok: true };
+    }
+    if (json.ok) {
+      return { ok: false, error: 'telegram response missing photo' };
+    }
+    return {
+      ok: false,
+      error: json.description ? `${res.status}: ${json.description}` : `status ${res.status}`,
+    };
+  } catch (err) {
+    return { ok: false, error: `telegram api unreachable: ${String(err)}` };
+  }
+}
+
+// ─── Watchdog 5s cho callback capture ────────────────────────────────────
+// Arm khi broadcast telegram_callback xuống extension; cancel khi extension
+// gửi sendPhoto / editMessage cùng chat_id+message_id. Nổ = editMessage
+// báo hết giờ + xoá keyboard — user không bao giờ nhìn spinner treo.
+const CALLBACK_WATCHDOG_MS = 5_000;
+const callbackWatchdogs = new Map(); // `${chat_id}:${message_id}` → timer
+
+function cancelCallbackWatchdog(chatId, messageId) {
+  const key = `${chatId}:${messageId}`;
+  const timer = callbackWatchdogs.get(key);
+  if (timer) {
+    clearTimeout(timer);
+    callbackWatchdogs.delete(key);
+  }
+}
+
+function armCallbackWatchdog(chatId, messageId) {
+  cancelCallbackWatchdog(chatId, messageId);
+  const key = `${chatId}:${messageId}`;
+  const timer = setTimeout(() => {
+    callbackWatchdogs.delete(key);
+    void callEditMessage(chatId, messageId, '⚠️ Hết giờ chụp — Chrome không phản hồi. Thử lại nhé.', undefined, CLEAR_KEYBOARD);
+  }, CALLBACK_WATCHDOG_MS);
+  callbackWatchdogs.set(key, timer);
+}
+
 /** Đọc toàn bộ body của một incoming request dưới dạng string. */
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -241,6 +326,51 @@ const server = http.createServer(async (req, res) => {
       update = JSON.parse(await readBody(req));
     } catch {
       res.writeHead(400).end('Bad Request: Invalid JSON');
+      return;
+    }
+
+    // ─── Inline-keyboard callback (nút bấm từ keyboard của /tabs command) ───
+    // Whitelist fail-closed giống tin nhắn. answerCallbackQuery được gateway
+    // gọi DUY NHẤT tại đây (Telegram reject answer lần 2 trên cùng
+    // callback_query_id — extension không bao giờ answer, mọi feedback của
+    // extension đi qua editMessage). Không extension nào online → tự edit
+    // message báo lỗi thay vì để user nhìn spinner treo.
+    if (update.callback_query) {
+      const cq = update.callback_query;
+      const chatId = cq.message?.chat?.id;
+      const messageId = cq.message?.message_id;
+      if (
+        !chatId || typeof messageId !== 'number' ||
+        !isChatAllowed(chatId)
+      ) {
+        res.writeHead(200).end('OK');
+        return;
+      }
+      void callAnswerCallbackQuery(cq.id, '⏳ Đang chụp tab…');
+      if (clients.size === 0) {
+        void callEditMessage(
+          chatId,
+          messageId,
+          '⚠️ Chrome extension đang offline — mở Chrome lên rồi thử lại.',
+          undefined,
+          CLEAR_KEYBOARD,
+        );
+        res.writeHead(200).end('OK');
+        return;
+      }
+      const payload = JSON.stringify({
+        kind: 'telegram_callback',
+        callback_query_id: cq.id,
+        data: typeof cq.data === 'string' ? cq.data : '',
+        chat_id: chatId,
+        message_id: messageId,
+        from: cq.from ? { id: cq.from.id, username: cq.from.username } : null,
+      });
+      for (const ws of clients) {
+        try { ws.send(payload); } catch { clients.delete(ws); }
+      }
+      armCallbackWatchdog(chatId, messageId);
+      res.writeHead(200).end('OK');
       return;
     }
 
@@ -347,7 +477,8 @@ wss.on('connection', (ws) => {
             result = { ok: false, error: 'message_id and text required' };
             break;
           }
-          result = await callEditMessage(data.chat_id, data.message_id, data.text, data.parse_mode);
+          cancelCallbackWatchdog(data.chat_id, data.message_id);
+          result = await callEditMessage(data.chat_id, data.message_id, data.text, data.parse_mode, data.reply_markup);
           break;
         case 'setMessageReaction':
           if (typeof data.message_id !== 'number') {
@@ -362,6 +493,17 @@ wss.on('connection', (ws) => {
             break;
           }
           result = await callDeleteMessage(data.chat_id, data.message_id);
+          break;
+        case 'sendPhoto':
+          if (typeof data.image_base64 !== 'string' || data.image_base64.length === 0) {
+            result = { ok: false, error: 'image_base64 required' };
+            break;
+          }
+          // Huỷ watchdog nếu capture xuất phát từ keyboard (message_id có mặt).
+          if (typeof data.message_id === 'number') {
+            cancelCallbackWatchdog(data.chat_id, data.message_id);
+          }
+          result = await callSendPhoto(data.chat_id, data.image_base64, data.caption);
           break;
         default:
           return; // 未知 kind——静默忽略
