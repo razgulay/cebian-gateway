@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#17212b">
+  <title>Cebian</title>
+  <!--
+    Cebian Telegram Mini App —— vanilla HTML/CSS/JS，no build step。
+    通过 bot 的 Menu Button 在 Telegram 客户端（Android / iOS / Desktop）打开。
+    initData 由 Telegram 用 HMAC-SHA256(bot_token) 签名，在 WS upgrade 阶段由
+    Koyeb gateway 校验 —— 见 gateway/lib/webapp.js verifyInitData。
+
+    Wire 协议（plan §Architecture）：
+      Mini App → Gateway  : { kind:'webapp_action', request_id, action }
+      Gateway → Mini App  : { kind:'webapp_action_result', request_id,
+                              ok, data?, error?, partial? }
+      Gateway → Mini App  : { kind:'extension_status', online: boolean }
+
+    capture_tab 约定（reviewer §2 lock-in）：extension 通过
+    chrome.tabs.captureVisibleTab 拿到 JPEG data URL，原样 forward 到
+    result.data.dataUrl 字符串字段（不在 gateway 端做 binary 编码）——
+    与现有 HTML 渲染路径（<img src=dataUrl>）天然对齐，避免 vanilla JS 端
+    处理 ArrayBuffer / Blob 转换。v2 streaming 如启用可再考虑 binary frame。
+  -->
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root {
+      --bg: #17212b;
+      --bg-elev: #1e2c39;
+      --fg: #e6e6e6;
+      --fg-muted: #7d8e9a;
+      --accent: #2ea6da;
+      --border: #243341;
+      --danger: #e53935;
+      --ok: #43a047;
+    }
+    :root[data-theme="light"] {
+      --bg: #ffffff;
+      --bg-elev: #f4f7fa;
+      --fg: #0f172a;
+      --fg-muted: #64748b;
+      --accent: #0284c7;
+      --border: #e2e8f0;
+      --danger: #dc2626;
+      --ok: #16a34a;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI",
+            system-ui, Roboto, sans-serif;
+      height: 100%;
+    }
+    body { display: flex; flex-direction: column; }
+    header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 16px;
+      background: var(--bg-elev);
+      border-bottom: 1px solid var(--border);
+      font-weight: 600;
+    }
+    .dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: var(--fg-muted);
+      flex: 0 0 auto;
+    }
+    .dot.online { background: var(--ok); }
+    .dot.offline { background: var(--fg-muted); }
+    nav {
+      display: flex;
+      gap: 0;
+      background: var(--bg-elev);
+      border-bottom: 1px solid var(--border);
+    }
+    nav button {
+      flex: 1;
+      background: transparent;
+      color: var(--fg-muted);
+      border: 0;
+      padding: 12px 8px;
+      font: inherit;
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+    }
+    nav button.active {
+      color: var(--fg);
+      border-bottom-color: var(--accent);
+    }
+    main {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      max-width: 480px;
+      margin: 0 auto;
+      width: 100%;
+    }
+    .tab { display: flex; flex-direction: column; gap: 12px; }
+    .tab.hidden { display: none; }
+    button.primary {
+      background: var(--accent);
+      color: white;
+      border: 0;
+      padding: 12px 16px;
+      border-radius: 8px;
+      font: inherit;
+      cursor: pointer;
+    }
+    button.primary:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    textarea {
+      width: 100%;
+      min-height: 100px;
+      padding: 10px;
+      background: var(--bg-elev);
+      color: var(--fg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font: inherit;
+      resize: vertical;
+    }
+    .result {
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      font-size: 13px;
+      word-break: break-word;
+      white-space: pre-wrap;
+      max-height: 60vh;
+      overflow-y: auto;
+    }
+    .result ul { padding-left: 20px; margin: 0; }
+    .result li { margin: 4px 0; }
+    .result img { max-width: 100%; border-radius: 4px; display: block; }
+    .error { color: var(--danger); }
+    .empty { color: var(--fg-muted); font-style: italic; }
+    .small { font-size: 12px; color: var(--fg-muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <span id="status-dot" class="dot offline"></span>
+    <span>Cebian · <span id="status-text">Offline</span></span>
+  </header>
+
+  <nav>
+    <button data-tab="actions" class="active">Actions</button>
+    <button data-tab="chat">Chat</button>
+  </nav>
+
+  <main>
+    <section id="tab-actions" class="tab">
+      <button id="btn-list-tabs" class="primary">List open tabs</button>
+      <button id="btn-capture" class="primary">Capture active tab</button>
+      <div id="actions-result" class="result empty">Action result appears here.</div>
+    </section>
+
+    <section id="tab-chat" class="tab hidden">
+      <textarea id="prompt-input" placeholder="Ask cebian — what should it do on your machine?"></textarea>
+      <button id="btn-send" class="primary">Send</button>
+      <div id="chat-output" class="result empty">Reply will appear here.</div>
+      <p class="small">
+        Replies run cebian's LLM on the active session <code>Telegram · Mini App · &lt;userId&gt;</code>.
+        Session is isolated from your Telegram chat sessions.
+      </p>
+    </section>
+  </main>
+
+  <script>
+    'use strict';
+
+    // ─── Telegram WebApp SDK init ───────────────────────────────────────────
+    const tg = window.Telegram && window.Telegram.WebApp;
+    if (tg) {
+      try { tg.ready(); } catch (e) { /* ignore */ }
+      try { tg.expand(); } catch (e) { /* ignore */ }
+      if (tg.colorScheme === 'light') {
+        document.documentElement.dataset.theme = 'light';
+      }
+    }
+    // initData 在 Telegram 客户端里是带 HMAC 签名的字符串；本地 dev 测试时
+    // tg 可能 undefined（initData=""），gateway 会 401 拒绝 —— 这是预期。
+    const initData = (tg && tg.initData) || '';
+    const wsScheme = location.protocol === 'https:' ? 'wss' : 'ws';
+    const wsUrl = `${wsScheme}://${location.host}/ws?type=webapp&initData=${encodeURIComponent(initData)}`;
+
+    // ─── DOM refs ───────────────────────────────────────────────────────────
+    const statusDot = document.getElementById('status-dot');
+    const statusText = document.getElementById('status-text');
+    const actionsResult = document.getElementById('actions-result');
+    const chatOutput = document.getElementById('chat-output');
+    const promptInput = document.getElementById('prompt-input');
+
+    // ─── Tabs ────────────────────────────────────────────────────────────────
+    document.querySelectorAll('nav button[data-tab]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const target = btn.dataset.tab;
+        document.querySelectorAll('nav button').forEach((b) => {
+          b.classList.toggle('active', b === btn);
+        });
+        document.querySelectorAll('.tab').forEach((t) => {
+          t.classList.toggle('hidden', t.id !== `tab-${target}`);
+        });
+      });
+    });
+
+    // ─── WS lifecycle ───────────────────────────────────────────────────────
+    let ws = null;
+    /** request_id → (data|error) → DOM render callback. */
+    const pendingRequests = new Map();
+    let reconnectDelay = 1000;
+
+    function setStatus(online) {
+      statusDot.classList.toggle('online', online);
+      statusDot.classList.toggle('offline', !online);
+      statusText.textContent = online ? 'Online' : 'Offline';
+    }
+
+    function connect() {
+      try {
+        ws = new WebSocket(wsUrl);
+      } catch (err) {
+        console.warn('[mini-app] WS constructor failed:', err);
+        scheduleReconnect();
+        return;
+      }
+
+      ws.addEventListener('open', () => {
+        console.log('[mini-app] WS open');
+        reconnectDelay = 1000; // reset backoff after successful connect
+      });
+
+      ws.addEventListener('message', (ev) => {
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch (err) {
+          console.warn('[mini-app] non-JSON frame:', err);
+          return;
+        }
+        handleMessage(msg);
+      });
+
+      ws.addEventListener('close', () => {
+        console.log('[mini-app] WS closed, will reconnect');
+        setStatus(false);
+        scheduleReconnect();
+      });
+
+      ws.addEventListener('error', (err) => {
+        console.warn('[mini-app] WS error:', err);
+        // 'close' fires right after — reconnect handled there.
+      });
+    }
+
+    function scheduleReconnect() {
+      setTimeout(connect, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 2, 30000); // cap at 30s
+    }
+
+    function handleMessage(msg) {
+      if (!msg || typeof msg.kind !== 'string') return;
+
+      if (msg.kind === 'extension_status') {
+        setStatus(msg.online === true);
+        return;
+      }
+
+      if (msg.kind === 'webapp_action_result') {
+        const pending = pendingRequests.get(msg.request_id);
+        if (!pending) {
+          console.warn('[mini-app] reply for unknown request_id:', msg.request_id);
+          return;
+        }
+        // TODO (v2 streaming): 当前每条 webapp_action_result 都立即 delete
+        // pending；扩展侧尚未实现 partial:true 流式 reply（Subtask 3 v1
+        // 总是 partial:false 单次返回），所以行为等价于"final reply"。v2 启用
+        // streaming 后改为：partial:true 时不 delete 也不调用 render，仅
+        // 累积数据；partial:false（或缺失）才调用 render 并 delete。
+        pending(msg);
+        pendingRequests.delete(msg.request_id);
+        return;
+      }
+    }
+
+    /** Send an action to the gateway → extension. `render` is called with the final result. */
+    function sendAction(action, render) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        render({ ok: false, error: 'not connected' });
+        return;
+      }
+      const request_id =
+        (crypto.randomUUID && crypto.randomUUID()) ||
+        `req-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+      pendingRequests.set(request_id, render);
+      ws.send(JSON.stringify({ kind: 'webapp_action', request_id, action }));
+    }
+
+    // ─── Action: List tabs ──────────────────────────────────────────────────
+    document.getElementById('btn-list-tabs').addEventListener('click', () => {
+      setActionBusy(true);
+      renderEmpty(actionsResult, 'Loading tabs…');
+      sendAction({ kind: 'get_tabs' }, (result) => {
+        setActionBusy(false);
+        if (!result.ok) {
+          renderError(actionsResult, result.error || 'unknown error');
+          return;
+        }
+        const tabs = (result.data && result.data.tabs) || [];
+        if (tabs.length === 0) {
+          renderEmpty(actionsResult, 'No tabs reported.');
+          return;
+        }
+        const ul = document.createElement('ul');
+        for (const tab of tabs) {
+          const li = document.createElement('li');
+          const title = document.createElement('div');
+          title.textContent = tab.title || '(untitled)';
+          const url = document.createElement('div');
+          url.className = 'small';
+          url.textContent = tab.url || '';
+          li.appendChild(title);
+          li.appendChild(url);
+          ul.appendChild(li);
+        }
+        actionsResult.classList.remove('empty', 'error');
+        actionsResult.replaceChildren(ul);
+      });
+    });
+
+    // ─── Action: Capture active tab ───────────────────────────────────────
+    document.getElementById('btn-capture').addEventListener('click', () => {
+      setActionBusy(true);
+      renderEmpty(actionsResult, 'Capturing…');
+      sendAction({ kind: 'capture_tab', format: 'jpeg', quality: 60 }, (result) => {
+        setActionBusy(false);
+        if (!result.ok) {
+          renderError(actionsResult, result.error || 'capture failed');
+          return;
+        }
+        const dataUrl = result.data && result.data.dataUrl;
+        if (!dataUrl) {
+          renderError(actionsResult, 'no dataUrl in response');
+          return;
+        }
+        const img = document.createElement('img');
+        img.src = dataUrl;
+        img.alt = 'captured active tab';
+        actionsResult.classList.remove('empty', 'error');
+        actionsResult.replaceChildren(img);
+      });
+    });
+
+    // ─── Action: Prompt ─────────────────────────────────────────────────────
+    document.getElementById('btn-send').addEventListener('click', () => {
+      const text = promptInput.value.trim();
+      if (!text) return;
+      renderEmpty(chatOutput, 'Waiting for cebian…');
+      setChatBusy(true);
+      sendAction({ kind: 'prompt', text }, (result) => {
+        setChatBusy(false);
+        if (!result.ok) {
+          renderError(chatOutput, result.error || 'prompt failed');
+          return;
+        }
+        const replyText = (result.data && (result.data.text || result.data.reply)) || '(empty response)';
+        chatOutput.classList.remove('empty', 'error');
+        chatOutput.textContent = replyText;
+      });
+    });
+
+    promptInput.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey)) {
+        ev.preventDefault();
+        document.getElementById('btn-send').click();
+      }
+    });
+
+    // ─── Render helpers ─────────────────────────────────────────────────────
+    function renderEmpty(el, msg) {
+      el.classList.remove('error');
+      el.classList.add('empty');
+      el.textContent = msg;
+    }
+    function renderError(el, msg) {
+      el.classList.remove('empty');
+      el.classList.add('error');
+      el.textContent = `⚠ ${msg}`;
+    }
+    function setActionBusy(busy) {
+      document.getElementById('btn-list-tabs').disabled = busy;
+      document.getElementById('btn-capture').disabled = busy;
+    }
+    function setChatBusy(busy) {
+      document.getElementById('btn-send').disabled = busy;
+    }
+
+    // ─── Boot ───────────────────────────────────────────────────────────────
+    setStatus(false);
+    connect();
+  </script>
+</body>
+</html>

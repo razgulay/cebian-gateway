@@ -9,6 +9,10 @@ RUN npm install --omit=dev && npm cache clean --force
 
 # Source
 COPY server.js ./
+# lib/ chứa Mini App WS routing module (gateway/lib/webapp.js).
+# public/ chứa Mini App static HTML (gateway/public/index.html).
+COPY lib/ ./lib/
+COPY public/ ./public/
 
 # Koyeb web service mặc định expose port 8000
 ENV PORT=8000

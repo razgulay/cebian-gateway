@@ -26,13 +26,22 @@
 //   PORT                    — mặc định 8000 (Koyeb web port mặc định)
 
 import http from 'node:http';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import fs from 'node:fs';
 import { WebSocketServer } from 'ws';
+import * as webapp from './lib/webapp.js';
 
 const env = process.env;
 const PORT = Number(env.PORT || 8000);
 
-// Server-side WebSocket sockets đang sống (set để delete O(1) trên close).
-const clients = new Set();
+/** 当前文件所在目录 —— 用于 `GET /app` static serve（Subtask 2 引入）。 */
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Extension 与 Mini App 的 WS 连接状态由 webapp 模块统一管理。server.js
+// 通过 `webapp.extensionClients` / `webapp.webappClients` / `webapp.allSockets()`
+// 提供给 heartbeat、/health、SIGTERM —— 不再保留独立的 Set（原 `clients`
+// 已在本次重构中移除）。
 
 /** Constant-time string compare — so byte cùng độ dài, không lộ timing. */
 function safeEqual(a, b) {
@@ -206,7 +215,11 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: 'ok',
-      clients: clients.size,
+      // 保留 `clients` 字段以保持向后兼容（总活跃 socket 数）；
+      // 新增 `extensions` / `webapps` 用于分别观察两条线。
+      clients: webapp.totalClients(),
+      extensions: webapp.extensionClients.size,
+      webapps: webapp.webappClients.size,
       ts: Date.now(),
       hasToken: Boolean(env.TELEGRAM_BOT_TOKEN),
       hasSecret: Boolean(env.TELEGRAM_WEBHOOK_SECRET),
@@ -269,21 +282,58 @@ const server = http.createServer(async (req, res) => {
       from: message.from ? { id: message.from.id, username: message.from.username } : null,
     });
 
-    for (const ws of clients) {
+    for (const ws of webapp.extensionClients) {
       try {
         ws.send(payload);
       } catch {
-        clients.delete(ws);
+        // socket 已死 —— close handler 由 webapp 模块负责清理
       }
     }
     res.writeHead(200).end('OK');
     return;
   }
 
+  // ─── GET /app — Telegram Mini App static HTML ──────────────────────────
+  // CSP 关键指令：
+  //   - frame-ancestors 限 Telegram 域名嵌入（防 clickjacking / iframe abuse）
+  //   - script-src 'unsafe-inline' 允许 inline <script>（HTML 用 vanilla 内嵌）
+  //   - connect-src wss:/ws: 同时支持 https 生产与 http localhost 开发
+  // Cache-Control: no-cache —— HTML 经常改，每次强制刷新
+  if (url.pathname === '/app') {
+    const filePath = path.join(__dirname, 'public/index.html');
+    const stream = fs.createReadStream(filePath);
+    // 流式读取时可能因为文件缺失 / 权限错误 / 部署 race 而 emit 'error'。
+    // 必须显式挂 handler，否则 Node 在下一 tick 打 Unhandled 'error' warning，
+    // 同时客户端会看到半截响应（headers 已写 200，但 body 中途断流）。
+    stream.on('error', (err) => {
+      console.error('[gateway] failed to read public/index.html:', err);
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+      }
+      res.end('Internal Server Error');
+    });
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      'Content-Security-Policy':
+        "default-src 'self' https://telegram.org; " +
+        "script-src 'self' https://telegram.org 'unsafe-inline'; " +
+        "style-src 'self' 'unsafe-inline'; " +
+        "img-src 'self' data:; " +
+        "connect-src 'self' wss: ws:; " +
+        "frame-ancestors https://web.telegram.org https://t.me;",
+    });
+    stream.pipe(res);
+    return;
+  }
+
   res.writeHead(404).end('Not Found');
 });
 
-// ─── WebSocket upgrade: chỉ nhận GET /ws?token=<WS_AUTH_TOKEN> ───
+// ─── WebSocket upgrade：3 条分支 ─────────────────────────────────────────
+//   ?type=webapp&initData=…   → Mini App，校验 HMAC + 白名单 → registerWebAppWs
+//   ?type=(default) &token=…  → Extension，使用 WS_AUTH_TOKEN         → registerExtensionWs
+//   （其它情况）               → 401 fail-closed
 
 const wss = new WebSocketServer({ noServer: true });
 
@@ -293,7 +343,44 @@ server.on('upgrade', (req, socket, head) => {
     socket.destroy();
     return;
   }
-  // fail-closed：chưa set WS_AUTH_TOKEN → từ chối mọi upgrade。
+
+  const type = url.searchParams.get('type');
+
+  if (type === 'webapp') {
+    // Mini App 路径 —— fail-closed：未设置 bot token → 拒绝（无 token
+    // 无法完成 initData 校验）。
+    if (!env.TELEGRAM_BOT_TOKEN) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    const initData = url.searchParams.get('initData') ?? '';
+    const verifyResult = webapp.verifyInitData(initData, env.TELEGRAM_BOT_TOKEN);
+    if (!verifyResult.ok) {
+      console.warn('[webapp] upgrade rejected:', verifyResult.error);
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    // 语义说明：Telegram DM (1:1) 中 `chat.id === user.id`；Mini App 通过
+    // Menu Button 打开运行在 DM 上下文，因此复用现有 `ALLOWED_CHAT_IDS`
+    // env 即可 —— 无需新增独立白名单。
+    const allowedIds = parseAllowedChatIds(env.ALLOWED_CHAT_IDS);
+    if (!allowedIds.has(String(verifyResult.userId))) {
+      console.warn(
+        `[webapp] upgrade rejected: userId ${verifyResult.userId} not in ALLOWED_CHAT_IDS`,
+      );
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      webapp.registerWebAppWs(ws, { userId: verifyResult.userId });
+    });
+    return;
+  }
+
+  // 默认：Extension。沿用原 WS_AUTH_TOKEN 校验（语义不变）。
   const token = url.searchParams.get('token');
   if (!env.WS_AUTH_TOKEN || token !== env.WS_AUTH_TOKEN) {
     socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
@@ -301,14 +388,16 @@ server.on('upgrade', (req, socket, head) => {
     return;
   }
   wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit('connection', ws, req);
+    webapp.registerExtensionWs(ws);
   });
 });
 
 wss.on('connection', (ws) => {
-  clients.add(ws);
+  // Extension 已在 upgrade callback 内通过 webapp.registerExtensionWs 注册；
+  // webapp 模块持有 Set 生命周期 + close/error/message cleanup（仅限
+  // webapp routing）。本 handler 只负责 Telegram-bound dispatch。
   ws.isAlive = true;
-  console.log(`[gateway] client connected (total: ${clients.size})`);
+  console.log(`[gateway] client connected (total: ${webapp.totalClients()})`);
 
   ws.on('pong', () => {
     ws.isAlive = true;
@@ -381,29 +470,31 @@ wss.on('connection', (ws) => {
     }
   });
 
+  // close / error handlers KHÔNG xoá ws khỏi Set nữa — webapp module đã lo
+  // phần đó (qua on('close') của registerExtensionWs). Logging vẫn chạy để
+  // operator thấy disconnect.
   ws.on('close', () => {
-    clients.delete(ws);
-    console.log(`[gateway] client disconnected (total: ${clients.size})`);
+    console.log(`[gateway] client disconnected (total: ${webapp.totalClients()})`);
   });
   ws.on('error', () => {
-    clients.delete(ws);
+    // ws 已 close → webapp 模块负责 Set 清理；此处无需操作。
   });
 });
 
-// Heartbeat：protocol-level ping mỗi 25s。Browser tự động Pong —— socket chết
-// (NAT drop / client tắt máy gấp) sẽ không Pong → terminate + dọn clients。
+// Heartbeat：protocol-level ping 每 25s。Browser 自动回 Pong —— socket 死亡
+// (NAT drop / 客户端突然关机) 不回 Pong → terminate + 由 webapp 模块的
+// on('close') handler 完成清理。
 setInterval(() => {
-  for (const ws of clients) {
+  for (const ws of webapp.allSockets()) {
     if (ws.isAlive === false) {
       ws.terminate();
-      clients.delete(ws);
       continue;
     }
     ws.isAlive = false;
     try {
       ws.ping();
     } catch {
-      clients.delete(ws);
+      // ignore — close handler sẽ dọn
     }
   }
 }, 25_000).unref();
@@ -416,7 +507,7 @@ server.listen(PORT, '0.0.0.0', () => {
 // Koyeb gửi SIGTERM khi redeploy / scale — đóng sạch để không treo container.
 for (const sig of ['SIGTERM', 'SIGINT']) {
   process.on(sig, () => {
-    for (const ws of clients) {
+    for (const ws of webapp.allSockets()) {
       try { ws.close(); } catch { /* ignore */ }
     }
     server.close(() => process.exit(0));
