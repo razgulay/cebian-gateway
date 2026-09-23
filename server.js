@@ -451,7 +451,27 @@ wss.on('connection', (ws) => {
     } catch {
       return; // payload hỏng (kể cả keepalive ' ' của extension) — bỏ qua
     }
-    if (!data || typeof data.kind !== 'string' || !data.chat_id) {
+    if (!data || typeof data.kind !== 'string') {
+      return;
+    }
+
+    // ─── Ping/Pong heartbeat (2 chiều) ─────────────────────────────────────
+    // Extension gửi {kind:'ping'} mỗi 15s. Trước đây heartbeat là 1-chiều
+    // (extension gửi space, gateway im lặng) → TCP half-open không bị phát
+    // hiện: extension tưởng connection sống, gateway broadcast callback_query
+    // xuống socket đã chết ngầm → extension không bao giờ nhận được → /tabs
+    // tap im lặng. Respond pong để extension track lastPongAt + tự reconnect
+    // khi >45s không thấy pong.
+    if (data.kind === 'ping') {
+      try {
+        ws.send(JSON.stringify({ kind: 'pong', ts: data.ts }));
+      } catch {
+        // socket đã chết — close handler sẽ dọn
+      }
+      return;
+    }
+
+    if (!data.chat_id) {
       return;
     }
 
