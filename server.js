@@ -339,13 +339,23 @@ const server = http.createServer(async (req, res) => {
       const cq = update.callback_query;
       const chatId = cq.message?.chat?.id;
       const messageId = cq.message?.message_id;
+      console.log('[gateway] callback_query received', {
+        cb_id: cq.id,
+        data: cq.data,
+        chat_id: chatId,
+        message_id: messageId,
+        whitelisted: chatId ? isChatAllowed(chatId) : false,
+        extensions: clients.size,
+      });
       if (
         !chatId || typeof messageId !== 'number' ||
         !isChatAllowed(chatId)
       ) {
+        console.warn('[gateway] callback_query REJECTED (whitelist or missing fields)');
         res.writeHead(200).end('OK');
         return;
       }
+      console.log('[gateway] callback_query accepted — answering + broadcasting to', clients.size, 'clients');
       void callAnswerCallbackQuery(cq.id, '⏳ Đang chụp tab…');
       if (clients.size === 0) {
         void callEditMessage(
