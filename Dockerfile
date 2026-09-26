@@ -1,16 +1,12 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Koyeb single-service bundle: cebian-gateway (Telegram relay) + 9router-go
-# (LLM router). One container, two ports, two public paths — no code merge.
+# (LLM router), behind one front proxy on a single public port.
 #
-# Koyeb free plan gives you ONE free instance, so both processes share the
-# 512 MB budget. Node gateway ~60-80 MB + 9router-go ~42 MB = fits.
+# Koyeb's free plan keeps only ONE exposed port on the service, so the router
+# cannot get its own route. proxy.mjs owns port 8000 (the port Koyeb exposes)
+# and splits: /router/* -> router :20130, everything else -> gateway :8001.
 #
-# Exposed ports (Koyeb -> Service -> Settings -> Exposed ports):
-#   8000  Public  HTTP  /          -> cebian-gateway  (webhook + /ws)
-#   20130 Public  HTTP  /router    -> 9router-go      (OpenAI/Claude API)
-#
-# Koyeb strips the route prefix before forwarding, so a request to
-# /router/v1/chat/completions reaches the router as /v1/chat/completions.
+# Memory: Node proxy ~10 MB + gateway ~70 MB + Go router ~42 MB, inside 512 MB.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Pull the router binary from the maintainer's own image, NOT the GitHub
@@ -34,16 +30,19 @@ RUN npm install --omit=dev && npm cache clean --force
 
 # Source
 COPY server.js ./
+COPY proxy.mjs ./
 COPY start.sh ./
 RUN chmod +x start.sh
 
-# Koyeb Web Services inject PORT; keep it explicit for the gateway.
+# Koyeb Web Services inject PORT; the front proxy binds it. The gateway and
+# router listen on internal ports the edge never sees.
 ENV PORT=8000 \
+    GATEWAY_PORT=8001 \
     HOSTNAME=0.0.0.0 \
     DATA_DIR=/data \
     ROUTER_PORT=20130
 
-EXPOSE 8000 20130
+EXPOSE 8000
 
 # Run as the non-root "node" user. /data must be writable for the SQLite DB.
 RUN mkdir -p /data && chown -R node:node /data /app
