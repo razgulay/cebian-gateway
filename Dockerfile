@@ -13,20 +13,18 @@
 # /router/v1/chat/completions reaches the router as /v1/chat/completions.
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Pull the router binary from the maintainer's own image, NOT the GitHub
+# release asset. The release assets come from `make cross` on ubuntu-latest
+# without CGO_ENABLED=0, so they link against glibc and die on musl with
+# "not found" (missing ld-linux). The image below is built with CGO_ENABLED=0
+# (see upstream Dockerfile) -> a real static binary that runs on alpine.
+FROM luqmenul/9router-go:1.9.2 AS router
+
 FROM node:20-alpine
 
-# 9router-go is a single CGO-free static binary — nothing to compile.
-# Pin the version + verify the checksum from the GitHub release page.
-# Bump these two lines when a new release lands (no auto-update on Koyeb).
-ARG ROUTER_VERSION=v1.9.2
-ARG ROUTER_SHA256=dc016179d78e973f31435c5c1d00a98289ffbb8f201145647152c153720bbd09
-
-RUN apk add --no-cache curl \
- && curl -fsSL -o /usr/local/bin/9router-go \
-      "https://github.com/luqman-v1/9router-go/releases/download/${ROUTER_VERSION}/9router-go-linux-amd64" \
- && echo "${ROUTER_SHA256}  /usr/local/bin/9router-go" | sha256sum -c - \
- && chmod +x /usr/local/bin/9router-go \
- && apk del curl
+COPY --from=router /usr/local/bin/9router-go /usr/local/bin/9router-go
+RUN chmod +x /usr/local/bin/9router-go \
+ && /usr/local/bin/9router-go version
 
 WORKDIR /app
 
