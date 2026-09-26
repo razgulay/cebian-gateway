@@ -1,47 +1,49 @@
 // cebian-gateway front proxy — one public port, two backends.
 //
-// Koyeb's free plan only keeps a single exposed port on the service, so the
-// router cannot get its own route. This front process owns port 8000 (the port
-// Koyeb already exposes) and splits traffic:
+// Koyeb's free plan keeps only a single exposed port, so the router cannot get
+// its own route. This front process owns port 8000 and splits by exact path.
 //
-//   /router/*  -> 127.0.0.1:20130  (9router-go, prefix stripped)
-//   /*         -> 127.0.0.1:8001   (cebian-gateway, Telegram relay + /ws)
+// Why the router keeps ROOT: 9router-go's dashboard is a SPA with hardcoded
+// absolute asset paths (`/assets/...`, `/api/...`). Mounting it under a prefix
+// makes the browser request `/assets/index-*.js` from the edge, which lands on
+// the wrong backend -> 404 -> blank page. So the SPA owns `/`.
 //
-// The gateway is moved to 8001 so this proxy can own 8000. The prefix strip
-// matters: 9router-go serves /v1/... and /health at its root, not under
-// /router, so `/router/v1/models` must arrive as `/v1/models`.
+// Why the gateway does NOT need a prefix: it only ever serves three fixed
+// paths — /health, /webhook/telegram (POST), /ws (upgrade). Nothing else, no
+// assets. So we route those three exactly and leave the rest to the router.
+// That keeps the Telegram webhook URL and the extension's WS URL unchanged.
 //
-// WebSocket upgrades (the gateway's /ws) are tunnelled too, since the same
-// socket has to work for both plain HTTP and upgrade requests.
+//   /health | /webhook/telegram | /ws  -> gateway :8001
+//   everything else                    -> router  :20130 (dashboard, /v1, /api)
 
 import http from 'node:http';
 
 const LISTEN_PORT = Number(process.env.PORT || 8000);
-const GATEWAY_PORT = Number(process.env.GATEWAY_PORT || 8001);
 const ROUTER_PORT = Number(process.env.ROUTER_PORT || 20130);
-const ROUTER_PREFIX = '/router';
+const GATEWAY_PORT = Number(process.env.GATEWAY_PORT || 8001);
 
-/** Pick the backend for a request path. Router wins on an exact prefix match
- *  on a path boundary, so `/routerfoo` still goes to the gateway. */
+// Exact paths the Telegram gateway owns. Keep in sync with server.js.
+const GATEWAY_PATHS = new Set(['/health', '/webhook/telegram', '/ws']);
+
+/** Gateway wins on an exact path match; everything else goes to the router. */
 function pickBackend(pathname) {
-  if (pathname === ROUTER_PREFIX || pathname.startsWith(ROUTER_PREFIX + '/')) {
-    return { port: ROUTER_PORT, strip: ROUTER_PREFIX };
-  }
-  return { port: GATEWAY_PORT, strip: '' };
+  return GATEWAY_PATHS.has(pathname)
+    ? { port: GATEWAY_PORT }
+    : { port: ROUTER_PORT };
 }
 
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host ?? 'localhost'}`);
-  const { port, strip } = pickBackend(url.pathname);
-
-  // Rewrite only the path; keep the query string untouched.
-  const targetPath = strip ? url.pathname.slice(strip.length) || '/' : url.pathname;
-
-  const headers = { ...req.headers, host: `127.0.0.1:${port}` };
-  if (strip) headers['x-forwarded-prefix'] = strip;
+  const { port } = pickBackend(url.pathname);
 
   const upstream = http.request(
-    { host: '127.0.0.1', port, method: req.method, path: targetPath + url.search, headers },
+    {
+      host: '127.0.0.1',
+      port,
+      method: req.method,
+      path: url.pathname + url.search,
+      headers: { ...req.headers, host: `127.0.0.1:${port}` },
+    },
     (up) => {
       res.writeHead(up.statusCode || 502, up.headers);
       up.pipe(res);
@@ -49,7 +51,7 @@ const server = http.createServer((req, res) => {
   );
 
   upstream.on('error', (err) => {
-    // The router may still be booting; report it instead of hanging the socket.
+    // A backend may still be booting; report it instead of hanging the socket.
     res.writeHead(502, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'upstream unreachable', port, detail: String(err) }));
   });
@@ -57,17 +59,16 @@ const server = http.createServer((req, res) => {
   req.pipe(upstream);
 });
 
-// WebSocket / upgrade tunnelling — same backend choice, raw socket splice.
+// WebSocket / upgrade tunnelling — /ws belongs to the gateway, so raw splice.
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, `http://${req.headers.host ?? 'localhost'}`);
-  const { port, strip } = pickBackend(url.pathname);
-  const targetPath = strip ? url.pathname.slice(strip.length) || '/' : url.pathname;
+  const { port } = pickBackend(url.pathname);
 
   const upstream = http.request({
     host: '127.0.0.1',
     port,
     method: req.method,
-    path: targetPath + url.search,
+    path: url.pathname + url.search,
     headers: { ...req.headers, host: `127.0.0.1:${port}` },
   });
 
@@ -90,6 +91,6 @@ server.on('upgrade', (req, socket, head) => {
 
 server.listen(LISTEN_PORT, '0.0.0.0', () => {
   console.log(
-    `[proxy] listening on 0.0.0.0:${LISTEN_PORT} | ${ROUTER_PREFIX}/* -> :${ROUTER_PORT} | /* -> :${GATEWAY_PORT}`,
+    `[proxy] listening on 0.0.0.0:${LISTEN_PORT} | /health,/webhook/telegram,/ws -> gateway :${GATEWAY_PORT} | /* -> router :${ROUTER_PORT}`,
   );
 });
