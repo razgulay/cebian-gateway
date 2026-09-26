@@ -3,24 +3,62 @@
 # (LLM router), behind one front proxy on a single public port.
 #
 # Koyeb's free plan keeps only ONE exposed port on the service, so the router
-# cannot get its own route. proxy.mjs owns port 8000 (the port Koyeb exposes)
-# and splits: /router/* -> router :20130, everything else -> gateway :8001.
+# cannot get its own route. proxy.mjs owns port 8000 and splits by exact path:
+#
+#   /health, /webhook/telegram, /ws  -> gateway :8001  (fixed paths only)
+#   everything else                  -> router  :20130 (dashboard, /v1, /api)
+#
+# The router keeps ROOT because its dashboard is a SPA with hardcoded absolute
+# asset paths; mounting it under a prefix breaks /assets/* and renders blank.
+# The gateway needs no prefix because it serves no assets.
 #
 # Memory: Node proxy ~10 MB + gateway ~70 MB + Go router ~42 MB, inside 512 MB.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Pull the router binary from the maintainer's own image, NOT the GitHub
-# release asset. The release assets come from `make cross` on ubuntu-latest
-# without CGO_ENABLED=0, so they link against glibc and die on musl with
-# "not found" (missing ld-linux). The image below is built with CGO_ENABLED=0
-# (see upstream Dockerfile) -> a real static binary that runs on alpine.
-FROM luqmenul/9router-go:1.9.2 AS router
+# Pinned upstream commit. Why build from source and not use a released image?
+# No published artifact carries the fresh-DATA_DIR schema bootstrap: tag v1.9.2
+# closed at 03:55, the "feat(db): self-bootstrap upstream core schema" commit
+# landed at 04:33, and the Docker Hub "latest" image was pushed at 04:04 with
+# the same digest as 1.9.2. On a brand-new DATA_DIR that build never creates the
+# core tables, so every write fails with "no such table: settings" and OAuth
+# connect dies at the final INSERT.
+#
+# A full 40-char SHA, not a branch — the build is reproducible. Bump to upgrade.
+ARG ROUTER_SHA=da3d26542b9c6c625898fc9855196828cd46d4d8
 
+# ── Fetch upstream source once, at the pinned commit ─────────────────────────
+FROM alpine:3.21 AS src
+ARG ROUTER_SHA
+RUN apk add --no-cache curl tar \
+ && curl -fsSL "https://codeload.github.com/luqman-v1/9router-go/tar.gz/${ROUTER_SHA}" -o /tmp/src.tgz \
+ && mkdir -p /src \
+ && tar -xzf /tmp/src.tgz --strip-components=1 -C /src \
+ && rm /tmp/src.tgz
+
+# ── Build the dashboard SPA (bun + Vite) ─────────────────────────────────────
+# web/dist/ is gitignored upstream and consumed via //go:embed dist/*, so the
+# Go stage below MUST receive these built assets before it compiles.
+FROM oven/bun:1-alpine AS web-builder
+WORKDIR /src
+COPY --from=src /src/ ./
+WORKDIR /src/web
+RUN bun install --frozen-lockfile && bun run build
+
+# ── Build the Go binary with the SPA embedded ────────────────────────────────
+FROM golang:1.27-alpine AS go-builder
+WORKDIR /src
+COPY --from=src /src/ ./
+COPY --from=web-builder /src/web/dist ./web/dist
+# CGO_ENABLED=0 is mandatory: the binary must run on musl (alpine). A cgo build
+# links glibc and dies with "not found" (missing ld-linux).
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/9router-go ./cmd/9router-go/ \
+ && /out/9router-go version
+
+# ── Runtime ──────────────────────────────────────────────────────────────────
 FROM node:20-alpine
 
-COPY --from=router /usr/local/bin/9router-go /usr/local/bin/9router-go
-RUN chmod +x /usr/local/bin/9router-go \
- && /usr/local/bin/9router-go version
+COPY --from=go-builder /out/9router-go /usr/local/bin/9router-go
+RUN chmod +x /usr/local/bin/9router-go
 
 WORKDIR /app
 
