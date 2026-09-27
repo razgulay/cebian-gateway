@@ -13,6 +13,10 @@
 # The gateway needs no prefix because it serves no assets.
 #
 # Memory: Node proxy ~10 MB + gateway ~70 MB + Go router ~42 MB, inside 512 MB.
+#
+# Local patches: patches/*.patch are applied on top of the pinned upstream
+# commit (see the src stage). Keep them minimal and re-derivable — on an
+# upstream fix landing, drop the patch and bump ROUTER_SHA.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Pinned upstream commit = tag v1.9.3 (2026-09-26): Kiro tool calling end-to-end
@@ -33,11 +37,17 @@ ARG ROUTER_SHA=044166efe11fbe16bcfa3e9188d47e2d463a08cd
 # ── Fetch upstream source once, at the pinned commit ─────────────────────────
 FROM alpine:3.21 AS src
 ARG ROUTER_SHA
-RUN apk add --no-cache curl tar \
+# Local fixes carried on top of the pinned upstream commit. Each patch is a
+# git-format diff generated against ROUTER_SHA exactly; a bump that breaks one
+# fails the build HERE instead of shipping a silently reverted fix.
+COPY patches/ /patches/
+RUN apk add --no-cache curl tar patch \
  && curl -fsSL "https://codeload.github.com/luqman-v1/9router-go/tar.gz/${ROUTER_SHA}" -o /tmp/src.tgz \
  && mkdir -p /src \
  && tar -xzf /tmp/src.tgz --strip-components=1 -C /src \
- && rm /tmp/src.tgz
+ && rm /tmp/src.tgz \
+ && cd /src \
+ && for p in /patches/*.patch; do echo "[patch] applying $(basename "$p")"; patch -p1 < "$p"; done
 
 # ── Build the dashboard SPA (bun + Vite) ─────────────────────────────────────
 # web/dist/ is gitignored upstream and consumed via //go:embed dist/*, so the

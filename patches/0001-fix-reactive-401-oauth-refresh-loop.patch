@@ -1,0 +1,573 @@
+diff --git a/internal/handlers/chat/gemini_handler.go b/internal/handlers/chat/gemini_handler.go
+index d3ea49f..4021110 100644
+--- a/internal/handlers/chat/gemini_handler.go
++++ b/internal/handlers/chat/gemini_handler.go
+@@ -186,7 +186,21 @@ func (h *ChatHandler) refreshOAuthTokenIfExpired(connectionID, currentToken stri
+ 	if oauthData != nil {
+ 		projectID = oauthData.ProjectID
+ 	}
+-	if oauthData == nil || oauthData.RefreshToken == "" || !oauthData.IsExpired() {
++	if oauthData == nil || oauthData.RefreshToken == "" {
++		return currentToken, projectID, nil
++	}
++	// In-memory hand-off: a token this process refreshed moments ago is newer
++	// than whatever the row holds. When the row still carries the pre-refresh
++	// token (persist failed, or a concurrent writer clobbered the merge),
++	// serve the newer one instead of riding the dead credential into a
++	// 401 -> refresh -> retry loop on every request.
++	if tok, pid, ok := peekFreshToken(connectionID); ok && tok != oauthData.AccessToken {
++		if pid == "" {
++			pid = projectID
++		}
++		return tok, pid, nil
++	}
++	if !oauthData.IsExpired() {
+ 		return currentToken, projectID, nil
+ 	}
+ 
+@@ -205,31 +219,22 @@ func (h *ChatHandler) refreshOAuthTokenIfExpired(connectionID, currentToken stri
+ 			ProviderSpecificData: oauth.StringMap(connPSD),
+ 		})
+ 		if err != nil {
++			forgetFreshToken(connectionID)
+ 			return currentToken, projectID, fmt.Errorf("OAuth refresh for %s: %w", provider, err)
+ 		}
+-		update := oauth.BuildConnectionUpdate(result)
+-		var existing map[string]any
+-		if err := json.Unmarshal([]byte(rawData), &existing); err != nil {
+-			log.Error("oauth", "unmarshal connection data failed", "conn", connectionID, "error", err)
+-			existing = make(map[string]any)
+-		}
+-		for k, v := range update {
+-			existing[k] = v
+-		}
+-		if result.ProjectID != "" {
+-			existing["projectId"] = result.ProjectID
+-		}
+-		mergedJSON, err := json.Marshal(existing)
+-		if err != nil {
+-			log.Error("oauth", "marshal connection data failed", "conn", connectionID, "error", err)
+-		} else {
+-			db.Exec("UPDATE providerConnections SET data = ?, updatedAt = ? WHERE id = ?",
+-				string(mergedJSON), time.Now().UTC().Format(time.RFC3339), connectionID)
+-		}
+ 		newPID := projectID
+ 		if result.ProjectID != "" {
+ 			newPID = result.ProjectID
+ 		}
++		if perr := h.persistOAuthRefresh(connectionID, result, newPID); perr != nil {
++			// A refresh that is not persisted is a refresh that did not
++			// happen: the next request reloads the dead token and the
++			// reactive-401 loop restarts. Loud failure beats silent success.
++			log.Error("oauth", "persist refreshed token failed", "provider", provider, "conn", connectionID, "error", perr)
++		}
++		// The retry proved the new token works upstream — hand it to the next
++		// request even if the persist above failed.
++		rememberFreshToken(connectionID, result.AccessToken, newPID, result.ExpiresIn)
+ 		log.Info("oauth", "token refreshed", "provider", provider, "project", newPID)
+ 		return result.AccessToken, newPID, nil
+ 	}
+@@ -243,25 +248,21 @@ func (h *ChatHandler) refreshOAuthTokenIfExpired(connectionID, currentToken stri
+ 	log.Info("oauth", "token expired, standard refresh", "provider", provider, "project", projectID)
+ 	tokenResp, err := providers.RefreshToken(cfg, oauthData.RefreshToken)
+ 	if err != nil {
++		forgetFreshToken(connectionID)
+ 		return currentToken, projectID, fmt.Errorf("OAuth refresh for %s: %w", provider, err)
+ 	}
+ 
+-	update := tokenResp.BuildConnectionUpdate()
+-	var existing map[string]any
+-	if err := json.Unmarshal([]byte(rawData), &existing); err != nil {
+-		log.Error("oauth", "unmarshal connection data failed", "conn", connectionID, "error", err)
+-		existing = make(map[string]any)
+-	}
+-	for k, v := range update {
+-		existing[k] = v
+-	}
+-	mergedJSON, err := json.Marshal(existing)
+-	if err != nil {
+-		log.Error("oauth", "marshal connection data failed", "conn", connectionID, "error", err)
+-	} else {
+-		db.Exec("UPDATE providerConnections SET data = ?, updatedAt = ? WHERE id = ?",
+-			string(mergedJSON), time.Now().UTC().Format(time.RFC3339), connectionID)
++	if perr := h.persistOAuthRefresh(connectionID, &oauth.TokenResult{
++		AccessToken: tokenResp.AccessToken,
++		ExpiresIn:   tokenResp.ExpiresIn,
++		Scope:       tokenResp.Scope,
++	}, projectID); perr != nil {
++		// A refresh that is not persisted is a refresh that did not happen:
++		// the next request reloads the dead token and the reactive-401 loop
++		// restarts. Loud failure beats silent success.
++		log.Error("oauth", "persist refreshed token failed", "provider", provider, "conn", connectionID, "error", perr)
+ 	}
++	rememberFreshToken(connectionID, tokenResp.AccessToken, projectID, tokenResp.ExpiresIn)
+ 
+ 	log.Info("oauth", "token refreshed", "provider", provider, "project", projectID)
+ 	return tokenResp.AccessToken, projectID, nil
+@@ -304,31 +305,28 @@ func (h *ChatHandler) forceRefreshOAuthToken(connectionID string) (string, strin
+ 			RefreshToken:         oauthData.RefreshToken,
+ 			ProviderSpecificData: oauth.StringMap(forcePSD),
+ 		})
+-		if err == nil && result != nil {
+-			var existing map[string]any
+-			if err := json.Unmarshal([]byte(rawData), &existing); err != nil {
+-				log.Error("oauth", "unmarshal conn data failed", "conn", connectionID, "error", err)
+-				existing = make(map[string]any)
+-			}
+-			existing["accessToken"] = result.AccessToken
+-			if result.RefreshToken != "" {
+-				existing["refreshToken"] = result.RefreshToken
+-			}
+-			if result.ProjectID != "" {
+-				existing["projectId"] = result.ProjectID
+-			}
+-			existing["expiresAt"] = time.Now().Add(time.Duration(result.ExpiresIn) * time.Second).Format(time.RFC3339)
+-			mergedJSON, err := json.Marshal(existing)
+-			if err != nil {
+-				log.Error("oauth", "marshal conn data failed", "conn", connectionID, "error", err)
+-			} else {
+-				db.Exec("UPDATE providerConnections SET data = ?, updatedAt = ? WHERE id = ?",
+-					string(mergedJSON), time.Now().UTC().Format(time.RFC3339), connectionID)
++		if err != nil || result == nil || result.AccessToken == "" {
++			// The refresh failed while a cached token for this connection may
++			// still be circulating — but it was just rejected upstream (this
++			// is the force path), so stop serving it.
++			forgetFreshToken(connectionID)
++			if err == nil {
++				err = fmt.Errorf("empty access token in refresh response")
+ 			}
++		} else {
+ 			newPID := oauthData.ProjectID
+ 			if result.ProjectID != "" {
+ 				newPID = result.ProjectID
+ 			}
++			if perr := h.persistOAuthRefresh(connectionID, result, newPID); perr != nil {
++				// A refresh that is not persisted is a refresh that did not
++				// happen: the next request reloads the dead token and the
++				// reactive-401 loop restarts. Loud failure beats silent success.
++				log.Error("oauth", "persist refreshed token failed", "provider", provider, "conn", connectionID, "error", perr)
++			}
++			// Hand the new token to the next request even if the persist above
++			// failed — the retry already proved it works upstream.
++			rememberFreshToken(connectionID, result.AccessToken, newPID, result.ExpiresIn)
+ 			return result.AccessToken, newPID, nil
+ 		}
+ 	}
+@@ -342,31 +340,72 @@ func (h *ChatHandler) forceRefreshOAuthToken(connectionID string) (string, strin
+ 	log.Info("oauth", "force refresh (standard)", "provider", provider)
+ 	tokenResp, err := providers.RefreshToken(cfg, oauthData.RefreshToken)
+ 	if err != nil {
++		forgetFreshToken(connectionID)
+ 		return "", "", fmt.Errorf("OAuth refresh for %s: %w", provider, err)
+ 	}
+ 
+-	update := tokenResp.BuildConnectionUpdate()
+-	var existing map[string]any
+-	if err := json.Unmarshal([]byte(rawData), &existing); err != nil {
+-		log.Error("oauth", "unmarshal conn data failed", "conn", connectionID, "error", err)
+-		existing = make(map[string]any)
++	if perr := h.persistOAuthRefresh(connectionID, &oauth.TokenResult{
++		AccessToken: tokenResp.AccessToken,
++		ExpiresIn:   tokenResp.ExpiresIn,
++		Scope:       tokenResp.Scope,
++	}, ""); perr != nil {
++		log.Error("oauth", "persist refreshed token failed", "provider", provider, "conn", connectionID, "error", perr)
+ 	}
+-	for k, v := range update {
+-		existing[k] = v
+-	}
+-	mergedJSON, err := json.Marshal(existing)
++	rememberFreshToken(connectionID, tokenResp.AccessToken, oauthData.ProjectID, tokenResp.ExpiresIn)
++
++	return tokenResp.AccessToken, oauthData.ProjectID, nil
++}
++
++// persistOAuthRefresh merges a refreshed OAuth token into the connection row in
++// ONE atomic statement — and CHECKS the result.
++//
++// Two defects this replaces (root of the reactive-401 refresh loop):
++//
++//   - The previous writers did read-modify-write in Go with the refresh HTTP
++//     call sitting between the row read and the row write, so any concurrent
++//     refresh, background tick, or projectId discovery that committed in that
++//     window was silently clobbered — the row reverted to the dead token.
++//   - The db.Exec error was discarded, so a failed persist looked identical to
++//     a successful one: every request reloaded the expired credential, hit 401,
++//     refreshed, and "succeeded" on the in-hand copy while the row never
++//     changed.
++//
++// The merge happens SQL-side via json_set (same pattern as
++// storeAntigravityProjectID), so concurrent writers cannot lose each other's
++// fields. refreshToken/projectId are only overwritten when non-empty (Google
++// omits refresh_token on refresh responses).
++func (h *ChatHandler) persistOAuthRefresh(connectionID string, result *oauth.TokenResult, projectID string) error {
++	if connectionID == "" || result == nil || result.AccessToken == "" {
++		return fmt.Errorf("persist OAuth refresh: missing connection id or access token")
++	}
++	expiresIn := result.ExpiresIn
++	if expiresIn <= 0 {
++		// Provider omitted expires_in: stamping expiresAt=now would mark the
++		// row permanently expired and re-select it for refresh forever
++		// (same fallback the background refresher applies).
++		expiresIn = 3600
++	}
++	expiresAt := time.Now().Add(time.Duration(expiresIn) * time.Second).UTC().Format(time.RFC3339)
++	res, err := h.Repo.RawDB().Exec(
++		`UPDATE providerConnections SET updatedAt = ?, data = json_set(data,
++			'$.accessToken', ?,
++			'$.expiresAt', ?,
++			'$.refreshToken', CASE WHEN ? != '' THEN ? ELSE json_extract(data, '$.refreshToken') END,
++			'$.projectId', CASE WHEN ? != '' THEN ? ELSE json_extract(data, '$.projectId') END)
++		WHERE id = ? AND json_valid(data)`,
++		time.Now().UTC().Format(time.RFC3339),
++		result.AccessToken, expiresAt,
++		result.RefreshToken, result.RefreshToken,
++		projectID, projectID,
++		connectionID,
++	)
+ 	if err != nil {
+-		log.Error("oauth", "marshal conn data failed", "conn", connectionID, "error", err)
+-	} else {
+-		db.Exec("UPDATE providerConnections SET data = ?, updatedAt = ? WHERE id = ?",
+-			string(mergedJSON), time.Now().UTC().Format(time.RFC3339), connectionID)
++		return fmt.Errorf("persist OAuth refresh for %s: %w", connectionID, err)
+ 	}
+-
+-	pid := ""
+-	if v, ok := existing["projectId"].(string); ok {
+-		pid = v
++	if n, _ := res.RowsAffected(); n == 0 {
++		return fmt.Errorf("persist OAuth refresh for %s: connection row missing or data not valid JSON", connectionID)
+ 	}
+-	return tokenResp.AccessToken, pid, nil
++	return nil
+ }
+ 
+ // handleGeminiStream processes Gemini stream SSE chunks and translates to OpenAI format.
+diff --git a/internal/handlers/chat/oauth_freshtoken.go b/internal/handlers/chat/oauth_freshtoken.go
+new file mode 100644
+index 0000000..dc0c20f
+--- /dev/null
++++ b/internal/handlers/chat/oauth_freshtoken.go
+@@ -0,0 +1,81 @@
++package chat
++
++import (
++	"sync"
++	"time"
++)
++
++// In-memory hand-off between a successful OAuth refresh and the next request
++// that needs the token.
++//
++// The providerConnections row is the durable source of truth, but the reactive
++// 401 refresh path exposes two ways for the row to keep serving a dead token
++// while every refresh "succeeds":
++//
++//  1. the persist step silently failing (the db.Exec error was discarded), and
++//  2. a concurrent read-modify-write clobbering the merge (the refresh HTTP
++//     call sat between the row read and the row write).
++//
++// In both cases the next request reloads the expired credential, hits 401,
++// refreshes again, retries OK with the in-hand copy — a per-request 401 loop
++// that never converges. This cache carries the just-refreshed token so the
++// next request consumes it even when the row write did not stick. Entries
++// expire with the token itself (minus the same 60s early-expiry margin
++// IsExpired applies), so they can never outlive the credential they hold.
++type freshTokenEntry struct {
++	token     string
++	projectID string
++	// expiresAt is the token's own lifetime, not the cache's — the entry is
++	// dropped once the token is inside the 60s pre-expiry window.
++	expiresAt time.Time
++}
++
++var (
++	freshTokenMu   sync.Mutex
++	freshTokenByID = map[string]freshTokenEntry{}
++)
++
++// defaultFreshExpiresIn matches background.go's fallback for providers whose
++// token endpoint omits expires_in; without it the entry would be born expired.
++const defaultFreshExpiresIn = 3600
++
++// rememberFreshToken records the token a refresh just obtained for connID.
++// Called after BOTH the reactive (force) and proactive refresh paths succeed,
++// replacing any earlier entry: the newest token always wins.
++func rememberFreshToken(connID, token, projectID string, expiresIn int) {
++	if connID == "" || token == "" {
++		return
++	}
++	if expiresIn <= 0 {
++		expiresIn = defaultFreshExpiresIn
++	}
++	freshTokenMu.Lock()
++	freshTokenByID[connID] = freshTokenEntry{
++		token:     token,
++		projectID: projectID,
++		expiresAt: time.Now().Add(time.Duration(expiresIn) * time.Second),
++	}
++	freshTokenMu.Unlock()
++}
++
++// peekFreshToken returns the in-memory token for connID when it is still
++// safely fresh (outside the 60s pre-expiry window), or ok=false.
++func peekFreshToken(connID string) (token, projectID string, ok bool) {
++	freshTokenMu.Lock()
++	defer freshTokenMu.Unlock()
++	e, found := freshTokenByID[connID]
++	if !found || time.Now().After(e.expiresAt.Add(-60*time.Second)) {
++		return "", "", false
++	}
++	return e.token, e.projectID, true
++}
++
++// forgetFreshToken drops the in-memory entry. The force-refresh path calls it
++// when a refresh fails: the cached token was just rejected upstream, so
++// keeping it would feed the dead credential to every subsequent request until
++// its TTL ran out.
++func forgetFreshToken(connID string) {
++	freshTokenMu.Lock()
++	delete(freshTokenByID, connID)
++	freshTokenMu.Unlock()
++}
+diff --git a/internal/handlers/chat/oauth_freshtoken_test.go b/internal/handlers/chat/oauth_freshtoken_test.go
+new file mode 100644
+index 0000000..cdd6903
+--- /dev/null
++++ b/internal/handlers/chat/oauth_freshtoken_test.go
+@@ -0,0 +1,234 @@
++package chat
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"9router/proxy/internal/db"
++	"9router/proxy/internal/proxy/oauth"
++)
++
++// TestReactive401RefreshPersistsAndFeedsNextRequest reproduces the
++// reactive-401 refresh loop: a request 401s, the reactive handler refreshes and
++// retries OK, and the NEXT request must not ride the dead token again.
++func TestReactive401RefreshPersistsAndFeedsNextRequest(t *testing.T) {
++	original := oauth.Get("antigravity")
++	if original != nil {
++		t.Cleanup(func() { oauth.Register("antigravity", original) })
++	}
++
++	var refreshCalls atomic.Int32
++	oauth.Register("antigravity", func(_ context.Context, _ *oauth.Params) (*oauth.TokenResult, error) {
++		n := refreshCalls.Add(1)
++		return &oauth.TokenResult{
++			AccessToken: fmt.Sprintf("new-token-%d", n),
++			ExpiresIn:   3600,
++			// RefreshToken omitted on purpose: Google rarely rotates it on
++			// refresh, and the row's stored one must survive the merge.
++		}, nil
++	})
++	t.Cleanup(func() {
++		forgetFreshToken("ag-loop")
++	})
++
++	database, cleanup := setupChatTestDB(t)
++	defer cleanup()
++
++	connData := `{"accessToken":"stale-token","refreshToken":"rt-1","expiresAt":"2099-01-01T00:00:00Z","projectId":"proj-1","providerSpecificData":{"fingerprintId":"fp-9"}}`
++	if _, err := database.Exec(`INSERT INTO providerConnections (id, provider, authType, name, isActive, data, createdAt, updatedAt) VALUES ('ag-loop','antigravity','oauth','AG Loop',1,?,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')`, connData); err != nil {
++		t.Fatalf("seed connection: %v", err)
++	}
++	h := NewChatHandler(db.NewRepo(database))
++
++	// Step 1 — the upstream 401 fires the reactive force refresh
++	// (fallback.go forceRefreshOAuthToken path).
++	key, pid, err := h.forceRefreshOAuthToken("ag-loop")
++	if err != nil {
++		t.Fatalf("force refresh: %v", err)
++	}
++	if key != "new-token-1" || pid != "proj-1" {
++		t.Fatalf("force refresh returned key=%q pid=%q, want new-token-1/proj-1", key, pid)
++	}
++	if n := refreshCalls.Load(); n != 1 {
++		t.Fatalf("refresher called %d times after step 1, want 1", n)
++	}
++
++	// Step 2 — the refresh must be PERSISTED to the row, and the merge must
++	// keep fields it does not own (refreshToken, providerSpecificData).
++	var data string
++	if err := database.QueryRow(`SELECT data FROM providerConnections WHERE id = 'ag-loop'`).Scan(&data); err != nil {
++		t.Fatalf("read row: %v", err)
++	}
++	for _, want := range []string{
++		`"accessToken":"new-token-1"`,
++		`"refreshToken":"rt-1"`,
++		`"fingerprintId":"fp-9"`,
++		`"projectId":"proj-1"`,
++	} {
++		if !strings.Contains(data, want) {
++			t.Errorf("row missing %s after refresh persist: %s", want, data)
++		}
++	}
++
++	// Step 3 — THE LOOP. Simulate the persist being lost (row reverts to the
++	// dead token): the next request must still consume the refreshed token
++	// from the in-memory hand-off WITHOUT refreshing again.
++	if _, err := database.Exec(`UPDATE providerConnections SET data = ? WHERE id = 'ag-loop'`, connData); err != nil {
++		t.Fatalf("revert row: %v", err)
++	}
++	gotKey, gotPID, err := h.refreshOAuthTokenIfExpired("ag-loop", "stale-token")
++	if err != nil {
++		t.Fatalf("next request refresh check: %v", err)
++	}
++	if gotKey != "new-token-1" || gotPID != "proj-1" {
++		t.Errorf("next request served stale credentials key=%q pid=%q, want new-token-1/proj-1", gotKey, gotPID)
++	}
++	if n := refreshCalls.Load(); n != 1 {
++		t.Errorf("refresher called %d times by the next request, want 1 (loop)", n)
++	}
++}
++
++// TestForceRefreshFailureDropsCachedToken: when the force refresh fails, the
++// cached entry (whose token upstream just rejected) must not keep being served.
++// Uses a provider that is NOT in KnownOAuthConfigs so the failed custom
++// refresher falls through to a config error instead of a real token endpoint.
++func TestForceRefreshFailureDropsCachedToken(t *testing.T) {
++	const provider = "antigravity-unittest"
++	original := oauth.Get(provider)
++	if original != nil {
++		t.Cleanup(func() { oauth.Register(provider, original) })
++	}
++	oauth.Register(provider, func(_ context.Context, _ *oauth.Params) (*oauth.TokenResult, error) {
++		return nil, fmt.Errorf("invalid_grant")
++	})
++	t.Cleanup(func() { forgetFreshToken("ag-fail") })
++
++	database, cleanup := setupChatTestDB(t)
++	defer cleanup()
++	connData := `{"accessToken":"stale-token","refreshToken":"rt-1","expiresAt":"2099-01-01T00:00:00Z","projectId":"proj-1"}`
++	if _, err := database.Exec(`INSERT INTO providerConnections (id, provider, authType, name, isActive, data, createdAt, updatedAt) VALUES ('ag-fail','antigravity-unittest','oauth','AG Fail',1,?,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')`, connData); err != nil {
++		t.Fatalf("seed connection: %v", err)
++	}
++	h := NewChatHandler(db.NewRepo(database))
++
++	rememberFreshToken("ag-fail", "rejected-token", "proj-1", 3600)
++	if _, _, err := h.forceRefreshOAuthToken("ag-fail"); err == nil {
++		t.Fatal("expected force refresh to fail")
++	}
++	if _, _, ok := peekFreshToken("ag-fail"); ok {
++		t.Error("rejected token still cached after failed force refresh")
++	}
++}
++
++// TestPersistOAuthRefreshMergesAndDefaultsExpiry: json_set merge semantics —
++// unrelated fields survive, empty refreshToken/projectId are preserved, and a
++// zero ExpiresIn stamps a real lifetime instead of "already expired".
++func TestPersistOAuthRefreshMergesAndDefaultsExpiry(t *testing.T) {
++	database, cleanup := setupChatTestDB(t)
++	defer cleanup()
++	connData := `{"apiKey":"key-1","accessToken":"old","refreshToken":"rt-1","providerSpecificData":{"projectId":"row-proj"}}`
++	if _, err := database.Exec(`INSERT INTO providerConnections (id, provider, authType, name, isActive, data, createdAt, updatedAt) VALUES ('ag-merge','antigravity','oauth','AG Merge',1,?,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')`, connData); err != nil {
++		t.Fatalf("seed connection: %v", err)
++	}
++	h := NewChatHandler(db.NewRepo(database))
++
++	before := time.Now().Add(-time.Minute)
++	if err := h.persistOAuthRefresh("ag-merge", &oauth.TokenResult{AccessToken: "at-2", RefreshToken: "rt-2", ExpiresIn: 0}, "proj-9"); err != nil {
++		t.Fatalf("persist: %v", err)
++	}
++	var data string
++	if err := database.QueryRow(`SELECT data FROM providerConnections WHERE id = 'ag-merge'`).Scan(&data); err != nil {
++		t.Fatalf("read row: %v", err)
++	}
++	for _, want := range []string{
++		`"accessToken":"at-2"`,
++		`"refreshToken":"rt-2"`,
++		`"projectId":"proj-9"`,
++		`"apiKey":"key-1"`,
++		`"projectId":"row-proj"`, // nested providerSpecificData survives
++	} {
++		if !strings.Contains(data, want) {
++			t.Errorf("row missing %s after merge: %s", want, data)
++		}
++	}
++	if exp := extractExpiresAtForTest(t, data); exp.Before(before.Add(time.Hour-time.Minute)) || exp.After(before.Add(time.Hour+time.Minute)) {
++		t.Errorf("zero ExpiresIn not defaulted to ~1h: got %v", exp)
++	}
++
++	// Second persist with empty refreshToken/projectId must PRESERVE them.
++	if err := h.persistOAuthRefresh("ag-merge", &oauth.TokenResult{AccessToken: "at-3", ExpiresIn: 1800}, ""); err != nil {
++		t.Fatalf("persist 2: %v", err)
++	}
++	if err := database.QueryRow(`SELECT data FROM providerConnections WHERE id = 'ag-merge'`).Scan(&data); err != nil {
++		t.Fatalf("read row 2: %v", err)
++	}
++	if !strings.Contains(data, `"accessToken":"at-3"`) {
++		t.Errorf("second persist did not update token: %s", data)
++	}
++	if !strings.Contains(data, `"refreshToken":"rt-2"`) {
++		t.Errorf("empty refreshToken clobbered the stored one: %s", data)
++	}
++	if !strings.Contains(data, `"projectId":"proj-9"`) {
++		t.Errorf("empty projectId clobbered the stored one: %s", data)
++	}
++
++	// Missing row must error (the old code discarded this class of failure).
++	if err := h.persistOAuthRefresh("no-such-conn", &oauth.TokenResult{AccessToken: "x", ExpiresIn: 60}, ""); err == nil {
++		t.Error("expected error persisting to a missing connection row")
++	}
++}
++
++func extractExpiresAtForTest(t *testing.T, data string) time.Time {
++	t.Helper()
++	i := strings.Index(data, `"expiresAt":"`)
++	if i < 0 {
++		t.Fatalf("no expiresAt in %s", data)
++	}
++	rest := data[i+len(`"expiresAt":"`):]
++	j := strings.Index(rest, `"`)
++	if j < 0 {
++		t.Fatalf("malformed expiresAt in %s", data)
++	}
++	exp, err := time.Parse(time.RFC3339, rest[:j])
++	if err != nil {
++		t.Fatalf("parse expiresAt %q: %v", rest[:j], err)
++	}
++	return exp
++}
++
++// TestFreshTokenLifecycle covers the hand-off map itself: newest wins, the
++// 60s pre-expiry window is honoured, and forget drops the entry.
++func TestFreshTokenLifecycle(t *testing.T) {
++	t.Cleanup(func() { forgetFreshToken("lc-1") })
++
++	if _, _, ok := peekFreshToken("lc-1"); ok {
++		t.Fatal("unexpected entry before remember")
++	}
++	rememberFreshToken("lc-1", "tok-a", "pid", 3600)
++	if tok, pid, ok := peekFreshToken("lc-1"); !ok || tok != "tok-a" || pid != "pid" {
++		t.Fatalf("peek = %q %q %v, want tok-a pid true", tok, pid, ok)
++	}
++	// Newest wins.
++	rememberFreshToken("lc-1", "tok-b", "pid", 3600)
++	if tok, _, ok := peekFreshToken("lc-1"); !ok || tok != "tok-b" {
++		t.Fatalf("peek after overwrite = %q %v, want tok-b true", tok, ok)
++	}
++	// A token inside its 60s pre-expiry window is not served.
++	rememberFreshToken("lc-1", "tok-dying", "pid", 30)
++	if _, _, ok := peekFreshToken("lc-1"); ok {
++		t.Fatal("entry served inside pre-expiry window")
++	}
++	// Empty token is refused.
++	rememberFreshToken("lc-2", "", "pid", 3600)
++	if _, _, ok := peekFreshToken("lc-2"); ok {
++		t.Fatal("empty token remembered")
++	}
++	forgetFreshToken("lc-1")
++	if _, _, ok := peekFreshToken("lc-1"); ok {
++		t.Fatal("entry survived forget")
++	}
++}
