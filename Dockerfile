@@ -15,16 +15,20 @@
 # Memory: Node proxy ~10 MB + gateway ~70 MB + Go router ~42 MB, inside 512 MB.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Pinned upstream commit. Why build from source and not use a released image?
-# No published artifact carries the fresh-DATA_DIR schema bootstrap: tag v1.9.2
-# closed at 03:55, the "feat(db): self-bootstrap upstream core schema" commit
-# landed at 04:33, and the Docker Hub "latest" image was pushed at 04:04 with
-# the same digest as 1.9.2. On a brand-new DATA_DIR that build never creates the
-# core tables, so every write fails with "no such table: settings" and OAuth
-# connect dies at the final INSERT.
+# Pinned upstream commit = tag v1.9.3 (2026-09-26): Kiro tool calling end-to-end
+# (tool catalogue on request + fragmented-argument reassembly), accessToken
+# instead of apiKey + endpoint rotation, /v1/models at full upstream parity,
+# and a GetCombos pool-deadlock fix. Ahead of the old v1.9.2-era pin, so the
+# fresh-DATA_DIR schema bootstrap stays in.
+#
+# Why build from source and not use a released image? Docker Hub artifacts have
+# lagged git history before: the v1.9.2 "latest" image was pushed before the
+# schema-bootstrap commit landed, so on a brand-new DATA_DIR it never created
+# the core tables and every write failed with "no such table: settings".
+# Building the exact commit sidesteps image staleness entirely.
 #
 # A full 40-char SHA, not a branch — the build is reproducible. Bump to upgrade.
-ARG ROUTER_SHA=da3d26542b9c6c625898fc9855196828cd46d4d8
+ARG ROUTER_SHA=044166efe11fbe16bcfa3e9188d47e2d463a08cd
 
 # ── Fetch upstream source once, at the pinned commit ─────────────────────────
 FROM alpine:3.21 AS src
