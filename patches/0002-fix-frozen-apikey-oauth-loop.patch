@@ -1,0 +1,191 @@
+diff --git a/internal/handlers/chat/fallback.go b/internal/handlers/chat/fallback.go
+index fa7c34d..cb7505c 100644
+--- a/internal/handlers/chat/fallback.go
++++ b/internal/handlers/chat/fallback.go
+@@ -366,6 +366,11 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
+ 
+ 	var ue *upstreamError
+ 	if errors.As(fwdErr, &ue) && ue.StatusCode == http.StatusUnauthorized && connectionID != "" {
++		// The reactive branch overwrites fwdErr with the retry result, so the
++		// first attempt's failure would otherwise vanish from the logs — log
++		// WHY upstream said 401 before refreshing (quota vs bad token vs
++		// project desync have very different fixes).
++		log.Warn("fallback", "upstream 401 before reactive refresh", "provider", provider, "model", model, "conn", connectionID, "body", extractErrorText(ue.Body))
+ 		refreshedKey, _, rErr := h.forceRefreshOAuthToken(connectionID)
+ 		if rErr == nil && refreshedKey != "" && refreshedKey != apiKey {
+ 			log.Info("fallback", "reactive 401 token refresh success, retrying request", "conn", connectionID)
+diff --git a/internal/handlers/chat/gemini_handler.go b/internal/handlers/chat/gemini_handler.go
+index 4021110..9438fae 100644
+--- a/internal/handlers/chat/gemini_handler.go
++++ b/internal/handlers/chat/gemini_handler.go
+@@ -201,6 +201,19 @@ func (h *ChatHandler) refreshOAuthTokenIfExpired(connectionID, currentToken stri
+ 		return tok, pid, nil
+ 	}
+ 	if !oauthData.IsExpired() {
++		// OAuth connections authenticate with the row's accessToken. Every
++		// connect flow stores the token in BOTH apiKey and accessToken
++		// (oauth/antigravity.go, cline.go, pkce.go, device.go, trae.go, zed.go
++		// all write "apiKey": <token>, "accessToken": <token>), but refreshes
++		// update accessToken only — so apiKey freezes at its connect-time
++		// value while the row itself looks fresh. extractAPIKey prefers
++		// apiKey, so without this guard the request rides that dead copy into
++		// a guaranteed 401 on EVERY request while the reactive refresh keeps
++		// "succeeding". Kiro's api_key mode is the documented exception: its
++		// apiKey is a real credential, not a mirrored token.
++		if live := oauthData.AccessToken; live != "" && currentToken != live && !isKiroApiKeyAuth(provider, connMap) {
++			return live, projectID, nil
++		}
+ 		return currentToken, projectID, nil
+ 	}
+ 
+@@ -268,6 +281,22 @@ func (h *ChatHandler) refreshOAuthTokenIfExpired(connectionID, currentToken stri
+ 	return tokenResp.AccessToken, projectID, nil
+ }
+ 
++// isKiroApiKeyAuth reports whether this connection runs Kiro's api_key auth
++// mode (upstream parity: open-sse/executors/kiro.js buildHeaders) — the one
++// case where apiKey is a real credential and must NOT be swapped for the
++// OAuth accessToken.
++func isKiroApiKeyAuth(provider string, connMap map[string]any) bool {
++	if provider != "kiro" {
++		return false
++	}
++	psd, _ := connMap["providerSpecificData"].(map[string]any)
++	if psd == nil {
++		return false
++	}
++	authMethod, _ := psd["authMethod"].(string)
++	return authMethod == "api_key"
++}
++
+ // forceRefreshOAuthToken unconditionally refreshes the OAuth token for a connection ID.
+ func (h *ChatHandler) forceRefreshOAuthToken(connectionID string) (string, string, error) {
+ 	if connectionID == "" {
+@@ -386,15 +415,22 @@ func (h *ChatHandler) persistOAuthRefresh(connectionID string, result *oauth.Tok
+ 		expiresIn = 3600
+ 	}
+ 	expiresAt := time.Now().Add(time.Duration(expiresIn) * time.Second).UTC().Format(time.RFC3339)
++	// When the connect flow mirrored accessToken into apiKey (all OAuth flows
++	// do), keep the mirror in step — otherwise apiKey freezes at its
++	// connect-time value while accessToken moves on. apiKey values that differ
++	// from accessToken are real credentials (iflow, kiro api_key mode) and are
++	// left untouched. Value expressions see the PRE-update row, so the CASE
++	// compares apiKey against the outgoing token.
+ 	res, err := h.Repo.RawDB().Exec(
+ 		`UPDATE providerConnections SET updatedAt = ?, data = json_set(data,
+ 			'$.accessToken', ?,
++			'$.apiKey', CASE WHEN json_extract(data, '$.apiKey') = json_extract(data, '$.accessToken') THEN ? ELSE json_extract(data, '$.apiKey') END,
+ 			'$.expiresAt', ?,
+ 			'$.refreshToken', CASE WHEN ? != '' THEN ? ELSE json_extract(data, '$.refreshToken') END,
+ 			'$.projectId', CASE WHEN ? != '' THEN ? ELSE json_extract(data, '$.projectId') END)
+ 		WHERE id = ? AND json_valid(data)`,
+ 		time.Now().UTC().Format(time.RFC3339),
+-		result.AccessToken, expiresAt,
++		result.AccessToken, result.AccessToken, expiresAt,
+ 		result.RefreshToken, result.RefreshToken,
+ 		projectID, projectID,
+ 		connectionID,
+diff --git a/internal/handlers/chat/oauth_freshtoken_test.go b/internal/handlers/chat/oauth_freshtoken_test.go
+index cdd6903..8cd7ac1 100644
+--- a/internal/handlers/chat/oauth_freshtoken_test.go
++++ b/internal/handlers/chat/oauth_freshtoken_test.go
+@@ -232,3 +232,99 @@ func TestFreshTokenLifecycle(t *testing.T) {
+ 		t.Fatal("entry survived forget")
+ 	}
+ }
++
++// TestFrozenApiKeyServesLiveAccessToken reproduces the real production loop:
++// the connect flow writes the token into BOTH apiKey and accessToken, but
++// refreshes update accessToken only — so apiKey stays frozen at its
++// connect-time value while the row looks fresh. extractAPIKey prefers apiKey,
++// so every request's first attempt rode the frozen dead copy into a 401 while
++// the reactive refresh kept "succeeding". The proactive path must hand back
++// the row's live accessToken instead.
++func TestFrozenApiKeyServesLiveAccessToken(t *testing.T) {
++	database, cleanup := setupChatTestDB(t)
++	defer cleanup()
++
++	// Exact production shape: apiKey frozen at connect time, accessToken
++	// refreshed since, expiresAt still in the future (row looks healthy).
++	connData := `{"apiKey":"frozen-t0","accessToken":"fresh-t5","refreshToken":"rt-1","expiresAt":"2099-01-01T00:00:00Z","projectId":"proj-1"}`
++	if _, err := database.Exec(`INSERT INTO providerConnections (id, provider, authType, name, isActive, data, createdAt, updatedAt) VALUES ('ag-frozen','antigravity','oauth','AG Frozen',1,?,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')`, connData); err != nil {
++		t.Fatalf("seed connection: %v", err)
++	}
++	h := NewChatHandler(db.NewRepo(database))
++
++	// This is exactly what the request path passes in: extractAPIKey's pick.
++	key, pid, err := h.refreshOAuthTokenIfExpired("ag-frozen", "frozen-t0")
++	if err != nil {
++		t.Fatalf("refresh check: %v", err)
++	}
++	if key != "fresh-t5" || pid != "proj-1" {
++		t.Errorf("served frozen credential key=%q pid=%q, want fresh-t5/proj-1", key, pid)
++	}
++}
++
++// TestKiroApiKeyModeNotOverridden: Kiro's api_key auth mode is the documented
++// exception — its apiKey is a real credential and must not be swapped for the
++// OAuth accessToken.
++func TestKiroApiKeyModeNotOverridden(t *testing.T) {
++	database, cleanup := setupChatTestDB(t)
++	defer cleanup()
++
++	connData := `{"apiKey":"real-kiro-key","accessToken":"aws-token","refreshToken":"rt-1","expiresAt":"2099-01-01T00:00:00Z","providerSpecificData":{"authMethod":"api_key"}}`
++	if _, err := database.Exec(`INSERT INTO providerConnections (id, provider, authType, name, isActive, data, createdAt, updatedAt) VALUES ('kiro-ak','kiro','oauth','Kiro AK',1,?,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')`, connData); err != nil {
++		t.Fatalf("seed connection: %v", err)
++	}
++	h := NewChatHandler(db.NewRepo(database))
++
++	key, _, err := h.refreshOAuthTokenIfExpired("kiro-ak", "real-kiro-key")
++	if err != nil {
++		t.Fatalf("refresh check: %v", err)
++	}
++	if key != "real-kiro-key" {
++		t.Errorf("kiro api_key credential was overridden: key=%q, want real-kiro-key", key)
++	}
++}
++
++// TestPersistRefreshMirrorsApiKeyWhenMirrored: rows created by the connect
++// flow carry apiKey == accessToken; a refresh must move BOTH, or apiKey
++// freezes and extractAPIKey serves a dead credential forever.
++func TestPersistRefreshMirrorsApiKeyWhenMirrored(t *testing.T) {
++	database, cleanup := setupChatTestDB(t)
++	defer cleanup()
++
++	connData := `{"apiKey":"t5","accessToken":"t5","refreshToken":"rt-1","expiresAt":"2099-01-01T00:00:00Z"}`
++	if _, err := database.Exec(`INSERT INTO providerConnections (id, provider, authType, name, isActive, data, createdAt, updatedAt) VALUES ('ag-mirror','antigravity','oauth','AG Mirror',1,?,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')`, connData); err != nil {
++		t.Fatalf("seed connection: %v", err)
++	}
++	h := NewChatHandler(db.NewRepo(database))
++
++	if err := h.persistOAuthRefresh("ag-mirror", &oauth.TokenResult{AccessToken: "t6", ExpiresIn: 3600}, ""); err != nil {
++		t.Fatalf("persist: %v", err)
++	}
++	var data string
++	if err := database.QueryRow(`SELECT data FROM providerConnections WHERE id = 'ag-mirror'`).Scan(&data); err != nil {
++		t.Fatalf("read row: %v", err)
++	}
++	if !strings.Contains(data, `"accessToken":"t6"`) {
++		t.Errorf("accessToken not updated: %s", data)
++	}
++	if !strings.Contains(data, `"apiKey":"t6"`) {
++		t.Errorf("mirrored apiKey not moved with accessToken: %s", data)
++	}
++
++	// A DISTINCT apiKey is a real credential and must stay untouched.
++	if _, err := database.Exec(`UPDATE providerConnections SET data = ? WHERE id = 'ag-mirror'`, `{"apiKey":"sk-real","accessToken":"t6","refreshToken":"rt-1","expiresAt":"2099-01-01T00:00:00Z"}`); err != nil {
++		t.Fatalf("reshape row: %v", err)
++	}
++	if err := h.persistOAuthRefresh("ag-mirror", &oauth.TokenResult{AccessToken: "t7", ExpiresIn: 3600}, ""); err != nil {
++		t.Fatalf("persist 2: %v", err)
++	}
++	if err := database.QueryRow(`SELECT data FROM providerConnections WHERE id = 'ag-mirror'`).Scan(&data); err != nil {
++		t.Fatalf("read row 2: %v", err)
++	}
++	if !strings.Contains(data, `"apiKey":"sk-real"`) {
++		t.Errorf("distinct real apiKey was clobbered: %s", data)
++	}
++	if !strings.Contains(data, `"accessToken":"t7"`) {
++		t.Errorf("accessToken not updated on second persist: %s", data)
++	}
++}
