@@ -323,6 +323,60 @@ async function callAnswerCallbackQuery(callbackQueryId, text) {
   }
 }
 
+/** Danh sách lệnh hiện cho autocomplete khi user gõ `/` trong chat.
+ *  Đăng ký một lần lúc boot (xem `registerBotCommands`) — Bot API lưu phía
+ *  Telegram, không cần gọi lại mỗi request. Command KHÔNG kèm `/` (Bot API
+ *  convention). Description ≤ 256 ký tự; ở đây ngắn vì chỉ là gợi ý autocomplete
+ *  (Telegram cắt phần dài trên mobile).
+ *
+ *  ⚠️ `setMyCommands` **THAY THẾ toàn bộ** danh sách, không phải append — kể cả
+ *  danh sách user từng set qua BotFather. Nên mọi lệnh bot hỗ trợ phải có mặt ở
+ *  đây, thiếu một cái là nó biến mất khỏi menu `/`. Thêm lệnh mới thì sửa mảng
+ *  này, đừng set tay qua BotFather (lần boot sau sẽ ghi đè).
+ *
+ *  Chỉ khai báo command mà gateway biết chắc: `/tabs` + `/model` do extension
+ *  xử lý (gateway chỉ forward), `/status` + `/ping` gateway tự trả lời. Đừng
+ *  thêm lệnh ở đây nếu chưa có phía xử lý — user gõ vào sẽ không ai đáp. */
+const BOT_COMMANDS = [
+  { command: 'model', description: 'Đổi model cho hội thoại này' },
+  { command: 'tabs', description: 'Chụp màn hình một tab đang mở' },
+  { command: 'status', description: 'Trạng thái gateway và agent' },
+  { command: 'ping', description: 'Kiểm tra gateway còn sống' },
+];
+
+/** setMyCommands — đăng ký autocomplete cho `/`. Best-effort: fail thì chỉ log,
+ *  KHÔNG chặn boot (autocomplete thiếu vẫn gõ tay được lệnh). Retry 1 lần sau
+ *  10s vì cold start trên Koyeb có thể chưa ra được internet. */
+async function registerBotCommands() {
+  const call = async () => {
+    const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setMyCommands`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ commands: BOT_COMMANDS }),
+    });
+    const json = await res.json().catch(() => ({}));
+    return json.ok ? { ok: true } : { ok: false, error: json.description ?? `status ${res.status}` };
+  };
+  try {
+    const first = await call();
+    if (first.ok) {
+      console.log('[gateway] bot commands registered:', BOT_COMMANDS.map((c) => c.command).join(', '));
+      return;
+    }
+    console.warn('[gateway] setMyCommands failed, retrying in 10s:', first.error);
+  } catch (err) {
+    console.warn('[gateway] setMyCommands unreachable, retrying in 10s:', String(err));
+  }
+  setTimeout(() => {
+    call()
+      .then((r) => {
+        if (r.ok) console.log('[gateway] bot commands registered on retry');
+        else console.warn('[gateway] setMyCommands retry failed:', r.error);
+      })
+      .catch((err) => console.warn('[gateway] setMyCommands retry unreachable:', String(err)));
+  }, 10_000).unref();
+}
+
 /** sendPhoto (web URL) — JSON POST, Telegram server-side tự fetch ảnh
  *  (≤10MB, jpg/png/gif; URL không tải được → Telegram trả 400, caller fallback).
  *  caption / parse_mode forward thẳng (caption markdown của AI reply);
@@ -941,6 +995,8 @@ setInterval(() => {
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`[gateway] listening on 0.0.0.0:${PORT}`);
   console.log(`[gateway] env: hasToken=${Boolean(env.TELEGRAM_BOT_TOKEN)} hasSecret=${Boolean(env.TELEGRAM_WEBHOOK_SECRET)} hasWsToken=${Boolean(env.WS_AUTH_TOKEN)} hasWhitelist=${Boolean(env.ALLOWED_CHAT_IDS && String(env.ALLOWED_CHAT_IDS).trim())}`);
+  // Autocomplete cho `/` — best-effort, không chặn boot (xem registerBotCommands).
+  if (env.TELEGRAM_BOT_TOKEN) void registerBotCommands();
 });
 
 // Koyeb gửi SIGTERM khi redeploy / scale — đóng sạch để không treo container.
