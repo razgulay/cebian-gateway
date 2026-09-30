@@ -40,6 +40,8 @@ RUN apk add --no-cache curl tar patch \
  && grep -q "isKiroApiKeyAuth" internal/handlers/chat/gemini_handler.go \
  && grep -q "json_extract(data, '\$.apiKey') = json_extract(data, '\$.accessToken')" internal/handlers/chat/gemini_handler.go \
  && grep -q "upstream 401 before reactive refresh" internal/handlers/chat/fallback.go \
+ && grep -q "repairGeminiToolIDs" internal/translator/gemini.go \
+ && grep -q "stripThoughtSig" internal/translator/gemini.go \
  && echo "[patch] all 401-loop fix markers present"
 
 # ── Build the dashboard SPA (bun + Vite) ─────────────────────────────────────
