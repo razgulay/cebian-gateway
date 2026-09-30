@@ -1,0 +1,205 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 3/3] fix(gemini): carry tool_call_id into functionCall/functionResponse
+
+An OpenAI request on the Gemini-native path (antigravity /
+claude-opus-4-6-thinking) emitted functionCall parts with no id, so the
+upstream Vertex-Anthropic converter saw an id-less tool_result and returned
+400 "messages.0.content.0.tool_result.tool_use_id: Field required". Every
+tool round-trip 400d, which also killed the reviewer worker (its handoff
+never completed).
+
+diff --git a/internal/translator/gemini.go b/internal/translator/gemini.go
+--- a/internal/translator/gemini.go
++++ b/internal/translator/gemini.go
+@@ -180,6 +180,15 @@
+ 		ToolCallID       string           `json:"tool_call_id,omitempty"`
+ 		ReasoningContent string           `json:"reasoning_content,omitempty"`
+ 	}
++	// OpenAI->Gemini runs on raw bodies and never passes through
++	// EnsureToolCallIDs (that repair lives on the Claude path), so an assistant
++	// tool_call or tool message that arrived without an id would emit an
++	// id-less functionCall/functionResponse pair, which Google's
++	// Vertex-Anthropic converter rejects as
++	// "tool_result.tool_use_id: Field required". Repair on the raw JSON so the
++	// typed parse below always sees complete ids.
++	oreq.Messages = repairGeminiToolIDs(oreq.Messages)
++
+ 	if err := json.Unmarshal(oreq.Messages, &msgs); err != nil {
+ 		return nil, fmt.Errorf("parse messages: %w", err)
+ 	}
+@@ -257,7 +266,7 @@
+ 					ts = DefaultThinkingSignature
+ 				}
+ 				firstFunctionCallSeen = true
+-				gp := GeminiPart{FunctionCall: &GeminiFunctionCall{Name: tc.Function.Name, Args: args}, ThoughtSignature: ts}
++				gp := GeminiPart{FunctionCall: &GeminiFunctionCall{Name: tc.Function.Name, ID: stripThoughtSig(tc.ID), Args: args}, ThoughtSignature: ts}
+ 				parts = append(parts, gp)
+ 			}
+ 
+@@ -298,6 +307,7 @@
+ 			parts := []GeminiPart{{
+ 				FunctionResponse: &GeminiFunctionResp{
+ 					Name:     name,
++					ID:       cleanID,
+ 					Response: &GeminiFuncResp{Result: resultValue},
+ 				},
+ 			}}
+@@ -405,6 +415,82 @@
+ 	return ""
+ }
+ 
++// stripThoughtSig removes the "__ts__<sig>" suffix the response translator
++// encodes into a tool call ID (see TranslateGeminiResponseToOpenAI). Gemini
++// matches a functionResponse to its functionCall by id, so both sides must
++// carry the same cleaned value: emitting the raw id on one side and the
++// stripped one on the other turns every tool round-trip into a 400.
++func stripThoughtSig(id string) string {
++	const sep = "__ts__"
++	if before, _, ok := strings.CutLast(id, sep); ok {
++		return before
++	}
++	return id
++}
++
++// repairGeminiToolIDs fills in a missing tool_call_id / tool_calls[].id on a
++// raw OpenAI messages array. Without it an id-less pair reaches Gemini as a
++// functionResponse with no id, and Google's Vertex-Anthropic converter drops
++// tool_use_id and 400s the whole request (PR #4090 parity for the Gemini path).
++func repairGeminiToolIDs(raw jsontext.Value) jsontext.Value {
++	if len(raw) == 0 {
++		return raw
++	}
++	var msgs []map[string]any
++	if err := json.Unmarshal(raw, &msgs); err != nil {
++		return raw
++	}
++	var pending []string
++	seq := 0
++	changed := false
++	for i := range msgs {
++		role, _ := msgs[i]["role"].(string)
++		switch role {
++		case "assistant":
++			tcs, _ := msgs[i]["tool_calls"].([]any)
++			if len(tcs) == 0 {
++				continue
++			}
++			for k := range tcs {
++				tc, _ := tcs[k].(map[string]any)
++				if tc == nil {
++					continue
++				}
++				id, _ := tc["id"].(string)
++				if id == "" {
++					id = fmt.Sprintf("call_%d_%d", seq, k)
++					tc["id"] = id
++					changed = true
++				}
++				pending = append(pending, id)
++			}
++			seq++
++		case "tool":
++			id, _ := msgs[i]["tool_call_id"].(string)
++			if id == "" && len(pending) > 0 {
++				msgs[i]["tool_call_id"] = pending[0]
++				pending = pending[1:]
++				changed = true
++			} else if id != "" {
++				for j, p := range pending {
++					if p == id {
++						pending = append(pending[:j], pending[j+1:]...)
++						break
++					}
++				}
++			}
++		}
++	}
++	if !changed {
++		return raw
++	}
++	out, err := json.Marshal(msgs)
++	if err != nil {
++		return raw
++	}
++	return jsontext.Value(out)
++}
++
+ // effortToBudget converts reasoning_effort string to thinking budget tokens.
+ func effortToBudget(effort string) int {
+ 	switch effort {
+diff --git a/internal/translator/gemini_toolid_test.go b/internal/translator/gemini_toolid_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/translator/gemini_toolid_test.go
+@@ -0,0 +1,71 @@
++package translator
++
++import (
++	json "encoding/json/v2"
++	"testing"
++)
++
++// Regression tests for patches/0003: an OpenAI->Gemini request whose assistant
++// tool_calls carry an id must emit functionCall.id and functionResponse.id with
++// the SAME cleaned value. Google's Vertex-Anthropic converter rejects a
++// functionResponse whose id is missing or unmatched with
++// "messages.0.content.0.tool_result.tool_use_id: Field required".
++
++func geminiToolIDs(t *testing.T, openaiBody string) (callIDs, respIDs []string) {
++	t.Helper()
++	out, err := TranslateOpenAIToGemini([]byte(openaiBody))
++	if err != nil {
++		t.Fatalf("TranslateOpenAIToGemini: %v", err)
++	}
++	var req GeminiRequest
++	if err := json.Unmarshal(out, &req); err != nil {
++		t.Fatalf("unmarshal gemini request: %v", err)
++	}
++	for _, c := range req.Contents {
++		for _, p := range c.Parts {
++			if p.FunctionCall != nil {
++				callIDs = append(callIDs, p.FunctionCall.ID)
++			}
++			if p.FunctionResponse != nil {
++				respIDs = append(respIDs, p.FunctionResponse.ID)
++			}
++		}
++	}
++	return callIDs, respIDs
++}
++
++func TestOpenAIToGeminiCarriesToolCallID(t *testing.T) {
++	body := `{"model":"m","messages":[{"role":"user","content":"go"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_abc123","type":"function","function":{"name":"fs_list","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_abc123","content":"[]"}]}`
++	calls, resps := geminiToolIDs(t, body)
++	if len(calls) != 1 || len(resps) != 1 {
++		t.Fatalf("calls=%v resps=%v", calls, resps)
++	}
++	if calls[0] != "call_abc123" || resps[0] != "call_abc123" {
++		t.Fatalf("id mismatch: call=%q resp=%q", calls[0], resps[0])
++	}
++}
++
++func TestOpenAIToGeminiRepairsMissingToolCallID(t *testing.T) {
++	body := `{"model":"m","messages":[{"role":"user","content":"go"},{"role":"assistant","content":null,"tool_calls":[{"type":"function","function":{"name":"fs_list","arguments":"{}"}}]},{"role":"tool","content":"[]"}]}`
++	calls, resps := geminiToolIDs(t, body)
++	if len(calls) != 1 || len(resps) != 1 {
++		t.Fatalf("calls=%v resps=%v", calls, resps)
++	}
++	if calls[0] == "" || resps[0] == "" {
++		t.Fatalf("id still empty: call=%q resp=%q", calls[0], resps[0])
++	}
++	if calls[0] != resps[0] {
++		t.Fatalf("repaired ids differ: call=%q resp=%q", calls[0], resps[0])
++	}
++}
++
++func TestOpenAIToGeminiStripsThoughtSigOnBothSides(t *testing.T) {
++	body := `{"model":"m","messages":[{"role":"user","content":"go"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_x__ts__SIG123","type":"function","function":{"name":"fs_list","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_x__ts__SIG123","content":"[]"}]}`
++	calls, resps := geminiToolIDs(t, body)
++	if len(calls) != 1 || len(resps) != 1 {
++		t.Fatalf("calls=%v resps=%v", calls, resps)
++	}
++	if calls[0] != "call_x" || resps[0] != "call_x" {
++		t.Fatalf("thought-sig not stripped: call=%q resp=%q", calls[0], resps[0])
++	}
++}
