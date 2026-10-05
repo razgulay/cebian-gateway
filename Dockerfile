@@ -18,7 +18,11 @@
 # and byte-truncates huge line-poor tool outputs (the saved_est=0 on 90k-token
 # payloads), 0007 validates thought signatures before sending so a corrupted
 # or stale one is replaced with the known-accepted default upfront instead of
-# paying Google's 400 + reactive re-send.
+# paying Google's 400 + reactive re-send, 0008 enforces the Gemini role
+# contract (contents carry only user/model; system text hoisted into
+# systemInstruction) and wires HTTP/2 dead-connection probing
+# (ReadIdleTimeout=2m) so a silently-dead connection fails fast into the
+# retry chain instead of hanging into an unhelpful 502 on heavy prompts.
 # These are git-format diffs against the pinned upstream SHA, so the router
 # must be compiled here. The v1.9.9 prebuilt release binary on GitHub contains
 # none of them. A prebuilt download was tried on 2026-09-29 (commits 4a44423 /
@@ -59,6 +63,8 @@ RUN apk add --no-cache curl tar patch \
  && ! grep -q "empty envelope response" internal/translator/antigravity.go \
  && grep -q "truncateBytes" internal/tokensaver/compress.go \
  && grep -q "validThoughtSignature" internal/translator/gemini.go \
+ && grep -q "NormalizeGeminiRequest" internal/translator/gemini.go \
+ && grep -q "ApplyHTTP2Keepalive" internal/constants/transport.go \
  && echo "[patch] all fix markers present"
 
 # ── Build the dashboard SPA (bun + Vite) ─────────────────────────────────────

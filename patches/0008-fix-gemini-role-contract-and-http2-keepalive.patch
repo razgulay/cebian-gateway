@@ -1,0 +1,515 @@
+From aec094beaaf4683ad5ecf3e4e210c6a8565e21f0 Mon Sep 17 00:00:00 2001
+From: razgulay <bantran09@outlook.com>
+Date: Mon, 5 Oct 2026 17:22:29 +0700
+Subject: [PATCH 8/8] fix(transport,translator): enforce the Gemini role
+ contract + probe silent HTTP/2 connections
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two upstream-failure classes on heavy Gemini traffic:
+
+400 \"Please use a valid role: user, model\" — the Gemini-native payload
+now has a single funnel, NormalizeGeminiRequest, that hoists
+system/developer-role contents into the top-level systemInstruction,
+canonicalizes assistant→model, sends functionResponse-bearing turns as
+user, and only lets user/model roles reach Google. TranslateOpenAIToGemini
+and WrapForAntigravity both run through it, so a converter regression or
+a hand-built Gemini body can no longer draw the 400. The antigravity
+signature backfill also defaults every unsigned sibling call now instead
+of only the first.
+
+HTTP/2 502 on heavy prompts — the transport upgraded with
+ForceAttemptHTTP2 alone leaves the h2 stack's ReadIdleTimeout at 0: a
+connection that silently died (NAT drop, half-open socket) is never
+probed and the request hangs until an outer layer reports an
+unhelpful 502. Transports are now upgraded through x/net/http2 with
+ReadIdleTimeout=2m / PingTimeout=30s, so silent-but-alive connections
+are PINGed (a long prompt thinking before its first SSE byte survives)
+and truly dead ones fail fast into the retry chain. The upgrade is
+idempotent — Configure runs twice over the same transport in production
+and a second registration panics otherwise.
+
+go.mod/go.sum: golang.org/x/net v0.58.0 becomes a direct dependency.
+---
+ go.mod                                        |   9 +-
+ go.sum                                        |  14 +--
+ internal/constants/transport.go               |  61 ++++++++++
+ internal/constants/transport_test.go          |  74 +++++-------
+ internal/translator/antigravity.go            |  19 ++-
+ internal/translator/gemini.go                 |  64 +++++++++-
+ .../translator/gemini_role_contract_test.go   | 112 ++++++++++++++++++
+ 7 files changed, 282 insertions(+), 71 deletions(-)
+ create mode 100644 internal/translator/gemini_role_contract_test.go
+
+diff --git a/go.mod b/go.mod
+index c40c15a..ec5b3bd 100644
+--- a/go.mod
++++ b/go.mod
+@@ -4,13 +4,17 @@ go 1.27
+ 
+ require (
+ 	github.com/go-chi/chi/v5 v5.3.1
+-	github.com/gorilla/websocket v1.5.3
+ 	github.com/google/uuid v1.6.0
++	github.com/gorilla/websocket v1.5.3
+ 	github.com/samber/lo v1.53.0
+ 	github.com/spf13/viper v1.21.0
+ 	github.com/urfave/cli/v2 v2.27.7
+ 	go.uber.org/fx v1.24.0
++	golang.org/x/crypto v0.57.0
++	golang.org/x/net v0.58.0
++	golang.org/x/sync v0.23.0
+ 	golang.org/x/sys v0.48.0
++	golang.org/x/text v0.42.0
+ 	modernc.org/sqlite v1.54.0
+ )
+ 
+@@ -35,9 +39,6 @@ require (
+ 	go.uber.org/multierr v1.10.0 // indirect
+ 	go.uber.org/zap v1.26.0 // indirect
+ 	go.yaml.in/yaml/v3 v3.0.4 // indirect
+-	golang.org/x/crypto v0.57.0 // indirect
+-	golang.org/x/sync v0.23.0 // indirect
+-	golang.org/x/text v0.42.0 // indirect
+ 	modernc.org/libc v1.74.1 // indirect
+ 	modernc.org/mathutil v1.7.1 // indirect
+ 	modernc.org/memory v1.11.0 // indirect
+diff --git a/go.sum b/go.sum
+index 39b40a5..64eb0ff 100644
+--- a/go.sum
++++ b/go.sum
+@@ -76,25 +76,19 @@ go.yaml.in/yaml/v3 v3.0.4 h1:tfq32ie2Jv2UxXFdLJdh3jXuOzWiL1fo0bu/FbuKpbc=
+ go.yaml.in/yaml/v3 v3.0.4/go.mod h1:DhzuOOF2ATzADvBadXxruRBLzYTpT36CKvDb3+aBEFg=
+ golang.org/x/crypto v0.57.0 h1:3ZVCjf8Ggz7zneR/EHRVx68Ctf+2pmIMP2UFhh9cC6M=
+ golang.org/x/crypto v0.57.0/go.mod h1:Fdz0i5U6CoizGwLda9DttjSk6qlZo25zYNtR+ycvuZA=
+-golang.org/x/mod v0.37.0 h1:vF1DjpVEshcIqoEaauuHebaLk1O1forxjxBaVn884JQ=
+-golang.org/x/mod v0.37.0/go.mod h1:m8S8VeM9r4dzDwjrKO0a1sZP3YjeMamRRlD+fmR2Q/0=
+ golang.org/x/mod v0.41.0 h1:qJmnOUb4YB+FsEuM3HcWucdZASCPGhsX6uljO6pog0c=
+-golang.org/x/sync v0.21.0 h1:HLII4xRRTtCRkxYp4HNFF0Js/Og6q2i++KXbg0gHCwM=
+-golang.org/x/sync v0.21.0/go.mod h1:9xrNwdLfx4jkKbNva9FpL6vEN7evnE43NNNJQ2LF3+0=
++golang.org/x/mod v0.41.0/go.mod h1:Ek9pY8RKWXwsWvd3rQiHYtMqkjSUV+s1Rj7j4H5Ur6o=
++golang.org/x/net v0.58.0 h1:ynWG7rqYi4ccpTEuPZ2QGWHktVEM9DMCj9yzDE0Q7To=
++golang.org/x/net v0.58.0/go.mod h1:YwCddHnFlT7eLQqVprV19OnhLGtc5xOKgE0RyqgfWAU=
+ golang.org/x/sync v0.23.0 h1:KameEIfc1IkluZyXWLn39Wd4tURc6GbCiISGiZm2bQk=
+ golang.org/x/sync v0.23.0/go.mod h1:sUUOizhqBxiL6pEWpqNLUiaJn1ShEbZ6BBqskPbjZm0=
+ golang.org/x/sys v0.6.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+-golang.org/x/sys v0.46.0 h1:noSf2Fq6F8DBgS+LysIkx7rIExoNHJsxOAtPp4rthXw=
+-golang.org/x/sys v0.46.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
+ golang.org/x/sys v0.48.0 h1:bbX/i/6MgT9BVLM9RT1thmxL04yeTAhbEz4SyadbXoo=
+ golang.org/x/sys v0.48.0/go.mod h1:hNLxWAXmnKAxqDtdwIYC4bM9oQPEecfsnNMuSxOs3og=
+-golang.org/x/text v0.28.0 h1:rhazDwis8INMIwQ4tpjLDzUhx6RlXqZNPEM0huQojng=
+-golang.org/x/text v0.28.0/go.mod h1:U8nCwOR8jO/marOQ0QbDiOngZVEBB7MAiitBuMjXiNU=
+ golang.org/x/text v0.42.0 h1:JbOZXgfeCPU9gacVtYliJqOhD+zhrEqK4LfdpmlUZqI=
+ golang.org/x/text v0.42.0/go.mod h1:ojzP1Z+2QtioaF8DTtO8K5q7JWVVYwZKenzujK0Zd0E=
+-golang.org/x/tools v0.47.0 h1:7Kn5x/d1svx/PzryTsqeoZN4TZwqeH5pGWjefhLi/1Q=
+-golang.org/x/tools v0.47.0/go.mod h1:dFHnyTvFWY212G+h7ZY4Vsp/K3U4/7W9TyVaAul8uCA=
+ golang.org/x/tools v0.49.0 h1:3NI7VXzL9+1WZD52Dx2ttoPwD5DWrFGpl9mFZDlmisI=
++golang.org/x/tools v0.49.0/go.mod h1:SJNXV9DBKT0UbdttsQjbfJlAE/q+y36++zo3uL3N0Oo=
+ gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
+ gopkg.in/check.v1 v1.0.0-20190902080502-41f04d3bba15 h1:YR8cESwS4TdDjEe65xsg0ogRM/Nc3DYOhEAlW+xobZo=
+ gopkg.in/check.v1 v1.0.0-20190902080502-41f04d3bba15/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
+diff --git a/internal/constants/transport.go b/internal/constants/transport.go
+index 8a0df07..eb8d604 100644
+--- a/internal/constants/transport.go
++++ b/internal/constants/transport.go
+@@ -3,6 +3,25 @@ package constants
+ import (
+ 	"net/http"
+ 	"time"
++
++	"golang.org/x/net/http2"
++)
++
++// HTTP/2 dead-connection probing. Upgrading through x/net/http2 exists ONLY
++// to tune these two: the default auto-upgrade (ForceAttemptHTTP2 alone)
++// leaves ReadIdleTimeout at 0, so a connection that goes silently dead —
++// NAT drop, half-open socket after a route change — is never probed and the
++// in-flight request hangs until an outer layer reports an unhelpful 502,
++// which on heavy prompts looks like a random timeout.
++const (
++	// HTTP2ReadIdleTimeout sends a PING when a connection has been silent
++	// this long. Must comfortably exceed the legitimate silent window of a
++	// long prompt thinking before its first SSE byte.
++	HTTP2ReadIdleTimeout = 2 * time.Minute
++	// HTTP2PingTimeout declares the connection dead when the PING is not
++	// acknowledged within this window; the request fails fast and the
++	// fallback chain can retry instead of hanging.
++	HTTP2PingTimeout = 30 * time.Second
+ )
+ 
+ // HTTPTransportConfig encapsulates connection pooling and timeout configurations
+@@ -51,6 +70,48 @@ func (c HTTPTransportConfig) Configure(t *http.Transport) {
+ 	t.TLSHandshakeTimeout = c.TLSHandshakeTimeout
+ 	t.ExpectContinueTimeout = c.ExpectContinueTimeout
+ 	t.ResponseHeaderTimeout = c.ResponseHeaderTimeout
++	configureHTTP2(t)
++}
++
++// configureHTTP2 hands the transport to x/net/http2 so the keepalive tuning
++// above actually applies. ConfigureTransports is the supported way to both
++// enable h2 and keep a handle to the h2 stack; on error the transport keeps
++// its previous behaviour (auto-h2 with default settings).
++func configureHTTP2(t *http.Transport) {
++	if h2 := ApplyHTTP2Keepalive(t); h2 == nil {
++		// Not configurable (already wired by someone else, or nil) — the
++		// transport's own ForceAttemptHTTP2 still upgrades requests.
++		return
++	}
++}
++
++// ApplyHTTP2Keepalive upgrades t for HTTP/2 with the dead-connection probing
++// above and returns the h2 stack handle, or nil when the upgrade is refused
++// or already done. The already-done case matters: callers Configure the same
++// transport more than once (connections_proxy.go builds with NewTransport
++// then re-Configures), and a second ConfigureTransports panics with
++// "http: HTTP/2 Transport already registered" — x/net v0.58 registers via
++// RegisterProtocol, which refuses duplicate schemes, and may use either the
++// Protocols field or TLSNextProto depending on version.
++func ApplyHTTP2Keepalive(t *http.Transport) *http2.Transport {
++	if t == nil {
++		return nil
++	}
++	if t.Protocols != nil && t.Protocols.HTTP2() {
++		return nil
++	}
++	if t.TLSNextProto != nil {
++		if _, done := t.TLSNextProto["https"]; done {
++			return nil
++		}
++	}
++	h2, err := http2.ConfigureTransports(t)
++	if err != nil || h2 == nil {
++		return nil
++	}
++	h2.ReadIdleTimeout = HTTP2ReadIdleTimeout
++	h2.PingTimeout = HTTP2PingTimeout
++	return h2
+ }
+ 
+ // NewTransport instantiates a fresh *http.Transport with these settings applied and Proxy: nil.
+diff --git a/internal/constants/transport_test.go b/internal/constants/transport_test.go
+index 2053749..acfc8c6 100644
+--- a/internal/constants/transport_test.go
++++ b/internal/constants/transport_test.go
+@@ -6,53 +6,37 @@ import (
+ 	"time"
+ )
+ 
+-func TestHTTPTransportConfig_NewTransport(t *testing.T) {
+-	cfg := HTTPTransportConfig{
+-		MaxIdleConns:          100,
+-		MaxIdleConnsPerHost:   50,
+-		IdleConnTimeout:       45 * time.Second,
+-		TLSHandshakeTimeout:   5 * time.Second,
+-		ExpectContinueTimeout: 2 * time.Second,
+-		ResponseHeaderTimeout: 30 * time.Second,
+-	}
+-
+-	tr := cfg.NewTransport()
+-	if tr == nil {
+-		t.Fatal("expected non-nil transport")
+-	}
+-
+-	if tr.MaxIdleConns != 100 {
+-		t.Errorf("expected MaxIdleConns=100, got %d", tr.MaxIdleConns)
+-	}
+-	if tr.MaxIdleConnsPerHost != 50 {
+-		t.Errorf("expected MaxIdleConnsPerHost=50, got %d", tr.MaxIdleConnsPerHost)
+-	}
+-	if tr.IdleConnTimeout != 45*time.Second {
+-		t.Errorf("expected IdleConnTimeout=45s, got %v", tr.IdleConnTimeout)
+-	}
+-	if tr.TLSHandshakeTimeout != 5*time.Second {
+-		t.Errorf("expected TLSHandshakeTimeout=5s, got %v", tr.TLSHandshakeTimeout)
+-	}
+-	if tr.ExpectContinueTimeout != 2*time.Second {
+-		t.Errorf("expected ExpectContinueTimeout=2s, got %v", tr.ExpectContinueTimeout)
+-	}
+-	if tr.ResponseHeaderTimeout != 30*time.Second {
+-		t.Errorf("expected ResponseHeaderTimeout=30s, got %v", tr.ResponseHeaderTimeout)
++// The upstream transport must upgrade to HTTP/2 with dead-connection probing
++// wired: ReadIdleTimeout=0 (the default when ForceAttemptHTTP2 upgrades
++// without x/net/http2) never probes a silently-dead connection, and an
++// in-flight request on a NAT-dropped h2 socket hangs until an outer layer
++// reports an unhelpful 502 — on heavy prompts it looks like a random timeout.
++func TestTransportConfiguresHTTP2Keepalive(t *testing.T) {
++	tr := &http.Transport{ForceAttemptHTTP2: true}
++	h2 := ApplyHTTP2Keepalive(tr)
++	if h2 == nil {
++		t.Fatal("x/net/http2 upgrade refused")
++	}
++	if h2.ReadIdleTimeout != HTTP2ReadIdleTimeout {
++		t.Errorf("ReadIdleTimeout = %v, want %v", h2.ReadIdleTimeout, HTTP2ReadIdleTimeout)
++	}
++	if h2.PingTimeout != HTTP2PingTimeout {
++		t.Errorf("PingTimeout = %v, want %v", h2.PingTimeout, HTTP2PingTimeout)
++	}
++	if DefaultHTTPTransportConfig.ResponseHeaderTimeout != 120*time.Second {
++		t.Errorf("ResponseHeaderTimeout = %v, want 2m", DefaultHTTPTransportConfig.ResponseHeaderTimeout)
+ 	}
+ }
+ 
+-func TestHTTPTransportConfig_Configure(t *testing.T) {
+-	tr := &http.Transport{}
++// Configure runs twice over the same transport in production (NewTransport
++// then an explicit Configure). The second pass must be a no-op for the h2
++// wiring, not a panic.
++func TestTransportConfigureIsIdempotent(t *testing.T) {
++	tr := DefaultHTTPTransportConfig.NewTransport()
++	defer func() {
++		if r := recover(); r != nil {
++			t.Fatalf("second Configure panicked: %v", r)
++		}
++	}()
+ 	DefaultHTTPTransportConfig.Configure(tr)
+-	if tr.MaxIdleConns != DefaultHTTPTransportConfig.MaxIdleConns {
+-		t.Errorf("expected MaxIdleConns=%d, got %d", DefaultHTTPTransportConfig.MaxIdleConns, tr.MaxIdleConns)
+-	}
+-	if tr.MaxIdleConnsPerHost != DefaultHTTPTransportConfig.MaxIdleConnsPerHost {
+-		t.Errorf("expected MaxIdleConnsPerHost=%d, got %d", DefaultHTTPTransportConfig.MaxIdleConnsPerHost, tr.MaxIdleConnsPerHost)
+-	}
+-}
+-
+-func TestHTTPTransportConfig_Configure_Nil(t *testing.T) {
+-	// Should not panic on nil transport
+-	DefaultHTTPTransportConfig.Configure(nil)
+ }
+diff --git a/internal/translator/antigravity.go b/internal/translator/antigravity.go
+index dc3fbbc..4711615 100644
+--- a/internal/translator/antigravity.go
++++ b/internal/translator/antigravity.go
+@@ -573,15 +573,12 @@ func fixAntigravityContents(req *GeminiRequest) bool {
+ 		}
+ 
+ 		if needsBackfill {
+-			firstFunctionCallSeen := false
++			// Default-sign EVERY unsigned functionCall, not just the first:
++			// default-signed siblings are the proven-accepted shape (the
++			// reactive 400-retry produces exactly that payload).
+ 			for idx, p := range filtered {
+-				if p.FunctionCall != nil {
+-					sig := p.ThoughtSignature
+-					if sig == "" && !firstFunctionCallSeen {
+-						sig = DefaultThinkingSignature
+-					}
+-					firstFunctionCallSeen = true
+-					filtered[idx].ThoughtSignature = sig
++				if p.FunctionCall != nil && p.ThoughtSignature == "" {
++					filtered[idx].ThoughtSignature = DefaultThinkingSignature
+ 				}
+ 			}
+ 		}
+@@ -591,9 +588,9 @@ func fixAntigravityContents(req *GeminiRequest) bool {
+ 		}
+ 		fixed[i] = GeminiContent{Role: role, Parts: filtered}
+ 	}
+-	normalized := NormalizeGeminiContents(fixed)
+-	if changed || len(normalized) != len(req.Contents) {
+-		req.Contents = normalized
++	before := len(req.Contents)
++	NormalizeGeminiRequest(req)
++	if changed || len(req.Contents) != before {
+ 		return true
+ 	}
+ 	return false
+diff --git a/internal/translator/gemini.go b/internal/translator/gemini.go
+index af2e7fb..659dac2 100644
+--- a/internal/translator/gemini.go
++++ b/internal/translator/gemini.go
+@@ -341,7 +341,7 @@ func TranslateOpenAIToGemini(openaiBody []byte) ([]byte, error) {
+ 
+ 	// Normalize Gemini contents: merge adjacent same-role messages, strip empty parts,
+ 	// and ensure first turn is "user" (parity with decolua/9router v0.5.75 #e7b5f09).
+-	req.Contents = NormalizeGeminiContents(req.Contents)
++	NormalizeGeminiRequest(&req)
+ 
+ 	// Tools
+ 	if len(oreq.Tools) > 0 {
+@@ -1023,6 +1023,68 @@ func geminiToolMediaParts(content any) []GeminiPart {
+ // does not start on a user turn, and equally one that ends on a model turn: a
+ // prefill, a truncated stream, or tool calls the client never answered all
+ // arrive that way and would 400 without the guards.
++// NormalizeGeminiRequest enforces the role contract Google's generateContent
++// endpoints demand — the funnel every Gemini-native payload passes through
++// (TranslateOpenAIToGemini output, WrapForAntigravity re-wrap):
++//
++//   - "system"/"developer"-role contents are hoisted into the top-level
++//     systemInstruction instead of riding inside contents;
++//   - "assistant" is canonicalized to "model"; functionResponse-bearing
++//     contents to "user"; anything unknown to "user";
++//   - then the usual NormalizeGeminiContents cleanup (merge adjacent,
++//     strip empties, first turn user, terminal-model answer turn).
++//
++// Without this a converter regression or a hand-built Gemini body reached
++// Google with a foreign role and drew 400 "Please use a valid role: user,
++// model".
++func NormalizeGeminiRequest(req *GeminiRequest) {
++	if req == nil {
++		return
++	}
++	var sysParts []GeminiPart
++	kept := make([]GeminiContent, 0, len(req.Contents))
++	for _, c := range req.Contents {
++		switch strings.ToLower(c.Role) {
++		case "system", "developer":
++			sysParts = append(sysParts, c.Parts...)
++			continue
++		}
++		kept = append(kept, c)
++	}
++	if len(sysParts) > 0 {
++		if req.SystemInstruction != nil {
++			sysParts = append(req.SystemInstruction.Parts, sysParts...)
++		}
++		req.SystemInstruction = &GeminiContent{Role: "user", Parts: sysParts}
++	}
++	for i := range kept {
++		if kept[i].Role == "" {
++			// No role to reason about — NormalizeGeminiContents drops these,
++			// same as it always has.
++			continue
++		}
++		kept[i].Role = geminiCanonicalRole(kept[i].Role, kept[i].Parts)
++	}
++	req.Contents = NormalizeGeminiContents(kept)
++}
++
++// geminiCanonicalRole maps any incoming role to the two Google accepts.
++func geminiCanonicalRole(role string, parts []GeminiPart) string {
++	for _, p := range parts {
++		if p.FunctionResponse != nil {
++			// A function result is a user-side turn regardless of the label
++			// the converter gave it.
++			return "user"
++		}
++	}
++	switch strings.ToLower(role) {
++	case "model", "assistant":
++		return "model"
++	default:
++		return "user"
++	}
++}
++
+ func NormalizeGeminiContents(contents []GeminiContent) []GeminiContent {
+ 	out := make([]GeminiContent, 0, len(contents)+2)
+ 	for _, c := range contents {
+diff --git a/internal/translator/gemini_role_contract_test.go b/internal/translator/gemini_role_contract_test.go
+new file mode 100644
+index 0000000..cf708e1
+--- /dev/null
++++ b/internal/translator/gemini_role_contract_test.go
+@@ -0,0 +1,112 @@
++package translator
++
++import (
++	"strings"
++	"testing"
++
++	json "encoding/json/v2"
++)
++
++// Regression tests for the role contract: Google's generateContent endpoints
++// accept ONLY roles "user" and "model" inside contents — anything else draws
++// 400 "Please use a valid role: user, model". System text belongs in the
++// top-level systemInstruction. NormalizeGeminiRequest is the funnel that
++// guarantees this for every Gemini-native payload the router sends.
++
++func TestNormalizeGeminiRequest_EnforcesRoleContract(t *testing.T) {
++	req := &GeminiRequest{
++		SystemInstruction: &GeminiContent{Role: "user", Parts: []GeminiPart{{Text: "existing instructions"}}},
++		Contents: []GeminiContent{
++			{Role: "system", Parts: []GeminiPart{{Text: "hoisted system text"}}},
++			{Role: "developer", Parts: []GeminiPart{{Text: "hoisted developer text"}}},
++			{Role: "user", Parts: []GeminiPart{{Text: "question"}}},
++			{Role: "assistant", Parts: []GeminiPart{{FunctionCall: &GeminiFunctionCall{Name: "f"}}}},
++			{Role: "assistant", Parts: []GeminiPart{{FunctionResponse: &GeminiFunctionResp{Name: "f"}}}},
++		},
++	}
++	NormalizeGeminiRequest(req)
++
++	if req.SystemInstruction == nil {
++		t.Fatal("systemInstruction missing")
++	}
++	var sysText string
++	for _, p := range req.SystemInstruction.Parts {
++		sysText += p.Text
++	}
++	if !strings.Contains(sysText, "existing instructions") || !strings.Contains(sysText, "hoisted system text") || !strings.Contains(sysText, "hoisted developer text") {
++		t.Fatalf("systemInstruction lost parts: %q", sysText)
++	}
++
++	for i, c := range req.Contents {
++		if c.Role != "user" && c.Role != "model" {
++			t.Errorf("contents[%d] role %q — only user/model allowed", i, c.Role)
++		}
++	}
++	// The user turn, then the call turn (assistant→model), then the response
++	// turn (functionResponse-bearing → user).
++	roles := make([]string, 0, len(req.Contents))
++	for _, c := range req.Contents {
++		roles = append(roles, c.Role)
++	}
++	joined := strings.Join(roles, ",")
++	if !strings.Contains(joined, "model") {
++		t.Errorf("assistant turn not canonicalized to model: %q", joined)
++	}
++	if !strings.Contains(joined, "user") {
++		t.Errorf("functionResponse turn not canonicalized to user: %q", joined)
++	}
++}
++
++// TranslateOpenAIToGemini must never place a system message inside contents.
++func TestTranslateOpenAIToGemini_SystemNeverInsideContents(t *testing.T) {
++	body := `{"model":"gemini-3-pro-preview","messages":[
++		{"role":"system","content":"be terse"},
++		{"role":"user","content":"hi"}
++	]}`
++	out, err := TranslateOpenAIToGemini([]byte(body))
++	if err != nil {
++		t.Fatalf("translate: %v", err)
++	}
++	var req GeminiRequest
++	if err := json.Unmarshal(out, &req); err != nil {
++		t.Fatal(err)
++	}
++	if req.SystemInstruction == nil || len(req.SystemInstruction.Parts) == 0 || req.SystemInstruction.Parts[0].Text != "be terse" {
++		t.Fatalf("system message not hoisted into systemInstruction: %s", out)
++	}
++	for _, c := range req.Contents {
++		if c.Role != "user" && c.Role != "model" {
++			t.Fatalf("contents role %q reached the payload", c.Role)
++		}
++	}
++}
++
++// WrapForAntigravity runs the same funnel over the wrapped body, so even a
++// hand-built Gemini payload cannot carry a foreign role to cloudcode-pa.
++func TestWrapForAntigravity_EnforcesRoleContract(t *testing.T) {
++	geminiBody := []byte(`{"contents":[
++		{"role":"system","parts":[{"text":"sys prompt"}]},
++		{"role":"user","parts":[{"text":"hi"}]},
++		{"role":"assistant","parts":[{"text":"hello"}]}
++	]}`)
++	wrapped, err := WrapForAntigravity(geminiBody, "proj-1", "gemini-3-pro-preview")
++	if err != nil {
++		t.Fatalf("wrap: %v", err)
++	}
++	var env AntigravityRequest
++	if err := json.Unmarshal(wrapped, &env); err != nil {
++		t.Fatal(err)
++	}
++	var req GeminiRequest
++	if err := json.Unmarshal(env.Request, &req); err != nil {
++		t.Fatal(err)
++	}
++	if req.SystemInstruction == nil || len(req.SystemInstruction.Parts) == 0 || req.SystemInstruction.Parts[0].Text != "sys prompt" {
++		t.Fatalf("system content not hoisted by WrapForAntigravity: %s", env.Request)
++	}
++	for i, c := range req.Contents {
++		if c.Role != "user" && c.Role != "model" {
++			t.Errorf("wrapped contents[%d] role %q — only user/model allowed", i, c.Role)
++		}
++	}
++}
