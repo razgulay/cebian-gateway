@@ -1,8 +1,21 @@
+From 0d77132bf24d984d37b47f0a48453975c96cc870 Mon Sep 17 00:00:00 2001
+From: razgulay <bantran09@outlook.com>
+Date: Mon, 5 Oct 2026 12:30:41 +0700
+Subject: [PATCH 2/4] fix(chat): serve the row's live accessToken instead of
+ the frozen apiKey
+
+Replay of the frozen-apiKey OAuth loop fix onto v1.9.9.
+---
+ internal/handlers/chat/fallback.go            |  5 +
+ internal/handlers/chat/gemini_handler.go      | 38 +++++++-
+ .../handlers/chat/oauth_freshtoken_test.go    | 96 +++++++++++++++++++
+ 3 files changed, 138 insertions(+), 1 deletion(-)
+
 diff --git a/internal/handlers/chat/fallback.go b/internal/handlers/chat/fallback.go
-index fa7c34d..cb7505c 100644
+index be91e41..be9ad68 100644
 --- a/internal/handlers/chat/fallback.go
 +++ b/internal/handlers/chat/fallback.go
-@@ -366,6 +366,11 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
+@@ -496,6 +496,11 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
  
  	var ue *upstreamError
  	if errors.As(fwdErr, &ue) && ue.StatusCode == http.StatusUnauthorized && connectionID != "" {
@@ -15,10 +28,10 @@ index fa7c34d..cb7505c 100644
  		if rErr == nil && refreshedKey != "" && refreshedKey != apiKey {
  			log.Info("fallback", "reactive 401 token refresh success, retrying request", "conn", connectionID)
 diff --git a/internal/handlers/chat/gemini_handler.go b/internal/handlers/chat/gemini_handler.go
-index 4021110..9438fae 100644
+index 12be0c0..5270a41 100644
 --- a/internal/handlers/chat/gemini_handler.go
 +++ b/internal/handlers/chat/gemini_handler.go
-@@ -201,6 +201,19 @@ func (h *ChatHandler) refreshOAuthTokenIfExpired(connectionID, currentToken stri
+@@ -207,6 +207,19 @@ func (h *ChatHandler) refreshOAuthTokenIfExpired(connectionID, currentToken stri
  		return tok, pid, nil
  	}
  	if !oauthData.IsExpired() {
@@ -38,7 +51,7 @@ index 4021110..9438fae 100644
  		return currentToken, projectID, nil
  	}
  
-@@ -268,6 +281,22 @@ func (h *ChatHandler) refreshOAuthTokenIfExpired(connectionID, currentToken stri
+@@ -279,6 +292,22 @@ func (h *ChatHandler) refreshOAuthTokenIfExpired(connectionID, currentToken stri
  	return tokenResp.AccessToken, projectID, nil
  }
  
@@ -61,7 +74,7 @@ index 4021110..9438fae 100644
  // forceRefreshOAuthToken unconditionally refreshes the OAuth token for a connection ID.
  func (h *ChatHandler) forceRefreshOAuthToken(connectionID string) (string, string, error) {
  	if connectionID == "" {
-@@ -386,15 +415,22 @@ func (h *ChatHandler) persistOAuthRefresh(connectionID string, result *oauth.Tok
+@@ -409,15 +438,22 @@ func (h *ChatHandler) persistOAuthRefresh(connectionID string, result *oauth.Tok
  		expiresIn = 3600
  	}
  	expiresAt := time.Now().Add(time.Duration(expiresIn) * time.Second).UTC().Format(time.RFC3339)

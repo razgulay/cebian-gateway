@@ -1,8 +1,25 @@
+From 7efa678a321ef5ad8d88845f24444f6e26d98c3c Mon Sep 17 00:00:00 2001
+From: razgulay <bantran09@outlook.com>
+Date: Mon, 5 Oct 2026 12:30:25 +0700
+Subject: [PATCH 1/4] fix(chat): break the reactive-401 OAuth refresh loop
+ (persist + fresh-token hand-off)
+
+Replay of the local 401-loop fix onto v1.9.9, adapted to the new
+parkRejectedOAuthAccount flow: failed refreshes park the account AND drop
+the cached token.
+---
+ internal/handlers/chat/gemini_handler.go      | 187 ++++++++------
+ internal/handlers/chat/oauth_freshtoken.go    |  81 ++++++
+ .../handlers/chat/oauth_freshtoken_test.go    | 234 ++++++++++++++++++
+ 3 files changed, 427 insertions(+), 75 deletions(-)
+ create mode 100644 internal/handlers/chat/oauth_freshtoken.go
+ create mode 100644 internal/handlers/chat/oauth_freshtoken_test.go
+
 diff --git a/internal/handlers/chat/gemini_handler.go b/internal/handlers/chat/gemini_handler.go
-index d3ea49f..4021110 100644
+index 0f34388..12be0c0 100644
 --- a/internal/handlers/chat/gemini_handler.go
 +++ b/internal/handlers/chat/gemini_handler.go
-@@ -186,7 +186,21 @@ func (h *ChatHandler) refreshOAuthTokenIfExpired(connectionID, currentToken stri
+@@ -192,7 +192,21 @@ func (h *ChatHandler) refreshOAuthTokenIfExpired(connectionID, currentToken stri
  	if oauthData != nil {
  		projectID = oauthData.ProjectID
  	}
@@ -25,10 +42,10 @@ index d3ea49f..4021110 100644
  		return currentToken, projectID, nil
  	}
  
-@@ -205,31 +219,22 @@ func (h *ChatHandler) refreshOAuthTokenIfExpired(connectionID, currentToken stri
- 			ProviderSpecificData: oauth.StringMap(connPSD),
+@@ -212,31 +226,22 @@ func (h *ChatHandler) refreshOAuthTokenIfExpired(connectionID, currentToken stri
  		})
  		if err != nil {
+ 			h.parkRejectedOAuthAccount(connectionID, err)
 +			forgetFreshToken(connectionID)
  			return currentToken, projectID, fmt.Errorf("OAuth refresh for %s: %w", provider, err)
  		}
@@ -65,12 +82,12 @@ index d3ea49f..4021110 100644
 +		// request even if the persist above failed.
 +		rememberFreshToken(connectionID, result.AccessToken, newPID, result.ExpiresIn)
  		log.Info("oauth", "token refreshed", "provider", provider, "project", newPID)
+ 		h.clearOAuthAccountPark(connectionID)
  		return result.AccessToken, newPID, nil
- 	}
-@@ -243,25 +248,21 @@ func (h *ChatHandler) refreshOAuthTokenIfExpired(connectionID, currentToken stri
- 	log.Info("oauth", "token expired, standard refresh", "provider", provider, "project", projectID)
+@@ -252,25 +257,21 @@ func (h *ChatHandler) refreshOAuthTokenIfExpired(connectionID, currentToken stri
  	tokenResp, err := providers.RefreshToken(cfg, oauthData.RefreshToken)
  	if err != nil {
+ 		h.parkRejectedOAuthAccount(connectionID, err)
 +		forgetFreshToken(connectionID)
  		return currentToken, projectID, fmt.Errorf("OAuth refresh for %s: %w", provider, err)
  	}
@@ -102,9 +119,9 @@ index d3ea49f..4021110 100644
  	}
 +	rememberFreshToken(connectionID, tokenResp.AccessToken, projectID, tokenResp.ExpiresIn)
  
- 	log.Info("oauth", "token refreshed", "provider", provider, "project", projectID)
- 	return tokenResp.AccessToken, projectID, nil
-@@ -304,31 +305,28 @@ func (h *ChatHandler) forceRefreshOAuthToken(connectionID string) (string, strin
+ 	h.clearOAuthAccountPark(connectionID)
+ 
+@@ -315,31 +316,28 @@ func (h *ChatHandler) forceRefreshOAuthToken(connectionID string) (string, strin
  			RefreshToken:         oauthData.RefreshToken,
  			ProviderSpecificData: oauth.StringMap(forcePSD),
  		})
@@ -150,13 +167,13 @@ index d3ea49f..4021110 100644
 +			// Hand the new token to the next request even if the persist above
 +			// failed — the retry already proved it works upstream.
 +			rememberFreshToken(connectionID, result.AccessToken, newPID, result.ExpiresIn)
+ 			h.clearOAuthAccountPark(connectionID)
  			return result.AccessToken, newPID, nil
  		}
- 	}
-@@ -342,31 +340,72 @@ func (h *ChatHandler) forceRefreshOAuthToken(connectionID string) (string, strin
- 	log.Info("oauth", "force refresh (standard)", "provider", provider)
+@@ -365,33 +363,72 @@ func (h *ChatHandler) forceRefreshOAuthToken(connectionID string) (string, strin
  	tokenResp, err := providers.RefreshToken(cfg, oauthData.RefreshToken)
  	if err != nil {
+ 		h.parkRejectedOAuthAccount(connectionID, err)
 +		forgetFreshToken(connectionID)
  		return "", "", fmt.Errorf("OAuth refresh for %s: %w", provider, err)
  	}
@@ -166,6 +183,16 @@ index d3ea49f..4021110 100644
 -	if err := json.Unmarshal([]byte(rawData), &existing); err != nil {
 -		log.Error("oauth", "unmarshal conn data failed", "conn", connectionID, "error", err)
 -		existing = make(map[string]any)
+-	}
+-	for k, v := range update {
+-		existing[k] = v
+-	}
+-	mergedJSON, err := json.Marshal(existing)
+-	if err != nil {
+-		log.Error("oauth", "marshal conn data failed", "conn", connectionID, "error", err)
+-	} else {
+-		db.Exec("UPDATE providerConnections SET data = ?, updatedAt = ? WHERE id = ?",
+-			string(mergedJSON), time.Now().UTC().Format(time.RFC3339), connectionID)
 +	if perr := h.persistOAuthRefresh(connectionID, &oauth.TokenResult{
 +		AccessToken: tokenResp.AccessToken,
 +		ExpiresIn:   tokenResp.ExpiresIn,
@@ -173,15 +200,15 @@ index d3ea49f..4021110 100644
 +	}, ""); perr != nil {
 +		log.Error("oauth", "persist refreshed token failed", "provider", provider, "conn", connectionID, "error", perr)
  	}
--	for k, v := range update {
--		existing[k] = v
--	}
--	mergedJSON, err := json.Marshal(existing)
 +	rememberFreshToken(connectionID, tokenResp.AccessToken, oauthData.ProjectID, tokenResp.ExpiresIn)
-+
+ 
+-	h.clearOAuthAccountPark(connectionID)
 +	return tokenResp.AccessToken, oauthData.ProjectID, nil
 +}
-+
+ 
+-	pid := ""
+-	if v, ok := existing["projectId"].(string); ok {
+-		pid = v
 +// persistOAuthRefresh merges a refreshed OAuth token into the connection row in
 +// ONE atomic statement — and CHECKS the result.
 +//
@@ -225,21 +252,13 @@ index d3ea49f..4021110 100644
 +		projectID, projectID,
 +		connectionID,
 +	)
- 	if err != nil {
--		log.Error("oauth", "marshal conn data failed", "conn", connectionID, "error", err)
--	} else {
--		db.Exec("UPDATE providerConnections SET data = ?, updatedAt = ? WHERE id = ?",
--			string(mergedJSON), time.Now().UTC().Format(time.RFC3339), connectionID)
++	if err != nil {
 +		return fmt.Errorf("persist OAuth refresh for %s: %w", connectionID, err)
  	}
--
--	pid := ""
--	if v, ok := existing["projectId"].(string); ok {
--		pid = v
+-	return tokenResp.AccessToken, pid, nil
 +	if n, _ := res.RowsAffected(); n == 0 {
 +		return fmt.Errorf("persist OAuth refresh for %s: connection row missing or data not valid JSON", connectionID)
- 	}
--	return tokenResp.AccessToken, pid, nil
++	}
 +	return nil
  }
  

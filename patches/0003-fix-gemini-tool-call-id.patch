@@ -1,17 +1,21 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-Subject: [PATCH 3/3] fix(gemini): carry tool_call_id into functionCall/functionResponse
+From 199a9a5a0fbe3ac5ff3d88b31f4ac73eac9cffed Mon Sep 17 00:00:00 2001
+From: razgulay <bantran09@outlook.com>
+Date: Mon, 5 Oct 2026 12:30:41 +0700
+Subject: [PATCH 3/4] fix(translator): carry tool_call_id into
+ functionCall/functionResponse
 
-An OpenAI request on the Gemini-native path (antigravity /
-claude-opus-4-6-thinking) emitted functionCall parts with no id, so the
-upstream Vertex-Anthropic converter saw an id-less tool_result and returned
-400 "messages.0.content.0.tool_result.tool_use_id: Field required". Every
-tool round-trip 400d, which also killed the reviewer worker (its handoff
-never completed).
+Replay of the Gemini tool-call-id fix onto v1.9.9.
+---
+ internal/translator/gemini.go             | 88 ++++++++++++++++++++++-
+ internal/translator/gemini_toolid_test.go | 71 ++++++++++++++++++
+ 2 files changed, 158 insertions(+), 1 deletion(-)
+ create mode 100644 internal/translator/gemini_toolid_test.go
 
 diff --git a/internal/translator/gemini.go b/internal/translator/gemini.go
+index 420a714..36c8225 100644
 --- a/internal/translator/gemini.go
 +++ b/internal/translator/gemini.go
-@@ -180,6 +180,15 @@
+@@ -180,6 +180,15 @@ func TranslateOpenAIToGemini(openaiBody []byte) ([]byte, error) {
  		ToolCallID       string           `json:"tool_call_id,omitempty"`
  		ReasoningContent string           `json:"reasoning_content,omitempty"`
  	}
@@ -27,7 +31,7 @@ diff --git a/internal/translator/gemini.go b/internal/translator/gemini.go
  	if err := json.Unmarshal(oreq.Messages, &msgs); err != nil {
  		return nil, fmt.Errorf("parse messages: %w", err)
  	}
-@@ -257,7 +266,7 @@
+@@ -257,7 +266,7 @@ func TranslateOpenAIToGemini(openaiBody []byte) ([]byte, error) {
  					ts = DefaultThinkingSignature
  				}
  				firstFunctionCallSeen = true
@@ -36,7 +40,7 @@ diff --git a/internal/translator/gemini.go b/internal/translator/gemini.go
  				parts = append(parts, gp)
  			}
  
-@@ -298,6 +307,7 @@
+@@ -298,6 +307,7 @@ func TranslateOpenAIToGemini(openaiBody []byte) ([]byte, error) {
  			parts := []GeminiPart{{
  				FunctionResponse: &GeminiFunctionResp{
  					Name:     name,
@@ -44,7 +48,7 @@ diff --git a/internal/translator/gemini.go b/internal/translator/gemini.go
  					Response: &GeminiFuncResp{Result: resultValue},
  				},
  			}}
-@@ -405,6 +415,82 @@
+@@ -406,6 +416,82 @@ func extractThoughtSig(id string) string {
  	return ""
  }
  
@@ -129,6 +133,7 @@ diff --git a/internal/translator/gemini.go b/internal/translator/gemini.go
  	switch effort {
 diff --git a/internal/translator/gemini_toolid_test.go b/internal/translator/gemini_toolid_test.go
 new file mode 100644
+index 0000000..564b039
 --- /dev/null
 +++ b/internal/translator/gemini_toolid_test.go
 @@ -0,0 +1,71 @@

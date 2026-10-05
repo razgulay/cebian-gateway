@@ -7,22 +7,25 @@
 #   9router-go :20130 internal (LLM router + embedded Svelte dashboard)
 #
 # WHY SOURCE BUILD (do not "simplify" this back to the prebuilt release binary):
-# the antigravity OAuth 401 loop is fixed ONLY by patches/0001 + patches/0002.
-# Those are local git-format diffs against the pinned upstream SHA, so the
-# router must be compiled here. The v1.9.5 prebuilt release binary on GitHub
-# does NOT contain the fix (verified: upstream main lacks isKiroApiKeyAuth and
-# the mirrored-apiKey json_set), so downloading it reintroduces the loop.
-# A prebuilt download was tried on 2026-09-29 (commits 4a44423 / 4b930e4) and
-# shipped the loop straight back into production.
+# the local patches under patches/ are not in upstream. 0001+0002 fix the
+# antigravity OAuth 401 refresh loop, 0003 carries tool_call ids into the
+# Gemini-native translator, 0004 ports the Vertex AI forwarding lane (without
+# it every vertex model — gemini-3.1-pro-preview included — gets Google's HTML
+# "404: The requested URL /v1 was not found" because the catalog shipped the
+# provider with no executor and the generic forwarder POSTed the bare /v1).
+# These are git-format diffs against the pinned upstream SHA, so the router
+# must be compiled here. The v1.9.9 prebuilt release binary on GitHub contains
+# none of them. A prebuilt download was tried on 2026-09-29 (commits 4a44423 /
+# 4b930e4) and shipped the 401 loop straight back into production.
 #
 # That download path also forced a Debian base (the release binary links glibc).
 # Building from source with CGO_ENABLED=0 keeps the alpine runtime.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Pinned upstream commit = tag v1.9.5 (2026-09-28, dfa59efc). Full 40-char SHA,
+# Pinned upstream commit = tag v1.9.9 (2026-10-05, f52294d8). Full 40-char SHA,
 # not a branch — the build is reproducible. Bump to upgrade, then re-verify the
 # patches still apply (the src stage fails the build if one no longer does).
-ARG ROUTER_SHA=dfa59efc2f620ea9742e140818c2b304d34b12ec
+ARG ROUTER_SHA=f52294d836e0dc92bbe7aaf18143faa67288b7f4
 
 # ── Fetch upstream source once, at the pinned commit, and apply local patches ─
 FROM alpine:3.21 AS src
@@ -37,12 +40,17 @@ RUN apk add --no-cache curl tar patch \
  && rm /tmp/src.tgz \
  && cd /src \
  && for p in /patches/*.patch; do echo "[patch] applying $(basename "$p")"; patch -p1 < "$p"; done \
+ && grep -q "persistOAuthRefresh" internal/handlers/chat/gemini_handler.go \
+ && grep -q "rememberFreshToken" internal/handlers/chat/oauth_freshtoken.go \
  && grep -q "isKiroApiKeyAuth" internal/handlers/chat/gemini_handler.go \
  && grep -q "json_extract(data, '\$.apiKey') = json_extract(data, '\$.accessToken')" internal/handlers/chat/gemini_handler.go \
  && grep -q "upstream 401 before reactive refresh" internal/handlers/chat/fallback.go \
  && grep -q "repairGeminiToolIDs" internal/translator/gemini.go \
  && grep -q "stripThoughtSig" internal/translator/gemini.go \
- && echo "[patch] all 401-loop fix markers present"
+ && grep -q "isVertexProvider" internal/handlers/chat/fallback.go \
+ && grep -q "publishers/google/models" internal/proxy/vertex.go \
+ && grep -q "postProcessVertexBody" internal/proxy/vertex.go \
+ && echo "[patch] all fix markers present"
 
 # ── Build the dashboard SPA (bun + Vite) ─────────────────────────────────────
 # web/dist/ is gitignored upstream and consumed via //go:embed dist/*, so the

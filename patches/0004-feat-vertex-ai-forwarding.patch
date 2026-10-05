@@ -1,0 +1,1121 @@
+From 14d69afbb5a160a7e33e6daf0977b67b32321494 Mon Sep 17 00:00:00 2001
+From: razgulay <bantran09@outlook.com>
+Date: Mon, 5 Oct 2026 12:30:58 +0700
+Subject: [PATCH 4/4] feat(vertex): port the Vertex AI chat forwarding lane
+ (fixes gemini-3.1-pro-preview 404)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The catalog shipped vertex/vertex-partner with models and dashboard
+entries but no executor, so chat fell through to the generic OpenAI
+forwarder which POSTed the registry BaseURL verbatim — bare
+https://aiplatform.googleapis.com/v1 — and Google answered with its HTML
+'404: The requested URL /v1 was not found on this server.' page for
+every model, gemini-3.1-pro-preview included.
+
+Port of open-sse/executors/vertex.js + translator/request/openai-to-vertex.js:
+- vertex: Gemini-native generateContent / streamGenerateContent?alt=sse
+  against publishers/google/models — project-scoped regional path for
+  OAuth, global publishers endpoint + ?key= for express API keys.
+- vertex-partner: OpenAI-compatible global openapi endpoint behind the
+  project-scoped path, delegated to the generic forwarder with the final
+  URL baked in.
+- Auth: Service Account JSON (RS256 JWT assertion → Bearer, cached per
+  client_email), ADC authorized_user JSON (refresh_token grant, cached
+  per token), express raw key (?key=), or a pre-set accessToken.
+- Body: TranslateOpenAIToGemini, then postProcessForVertex parity —
+  thoughtSignature replaced with the Vertex-native default and
+  functionCall/functionResponse ids stripped (Vertex rejects both).
+- Registry BaseURL drops the /v1 suffix (host root, matching upstream).
+---
+ docs/DASHBOARD_PROVIDER_PARITY.md         |  21 +-
+ internal/handlers/chat/fallback.go        |  12 +
+ internal/handlers/chat/vertex_handler.go  | 110 ++++
+ internal/providers/providers.go           |   8 +-
+ internal/proxy/vertex.go                  | 582 ++++++++++++++++++++++
+ internal/proxy/vertex_test.go             | 238 +++++++++
+ internal/proxy/vertex_testhelpers_test.go |  36 ++
+ 7 files changed, 1000 insertions(+), 7 deletions(-)
+ create mode 100644 internal/handlers/chat/vertex_handler.go
+ create mode 100644 internal/proxy/vertex.go
+ create mode 100644 internal/proxy/vertex_test.go
+ create mode 100644 internal/proxy/vertex_testhelpers_test.go
+
+diff --git a/docs/DASHBOARD_PROVIDER_PARITY.md b/docs/DASHBOARD_PROVIDER_PARITY.md
+index de60dcb..52c5d35 100644
+--- a/docs/DASHBOARD_PROVIDER_PARITY.md
++++ b/docs/DASHBOARD_PROVIDER_PARITY.md
+@@ -360,12 +360,23 @@ Pendukung: `executor.BuildQoderCosyHeaders` sekarang **publik** dan menghitung
+ sebelumnya hardcode `/api/v2/service/pro/sse/agent_chat_generation`. Nilai untuk
+ URL chat tidak berubah (dikunci `qoder_cosy_test.go`).
+ 
+-**Belum diport** (di luar key-validate): `vertex`/`vertex-partner` (SA JSON vs raw
+-key), `grok-web`-style STATSIG refresh, `commandcode`/`qoder` chat-probe khusus,
+-`blackbox`, `deepgram Token`, `opencode-go`, `xai` 403-as-valid, dan `validateUrl`
+-spesifik per provider (deepseek `/user/balance`, dll.). Untuk provider ini generic
+-`/models` + fallback chat dipakai; hasilnya tetap benar untuk 401/403 tapi pesan
++**Belum diport** (di luar key-validate): `grok-web`-style STATSIG refresh,
++`commandcode`/`qoder` chat-probe khusus, `blackbox`, `deepgram Token`,
++`opencode-go`, `xai` 403-as-valid, dan `validateUrl` spesifik per provider
++(deepseek `/user/balance`, dll.). Untuk provider ini generic `/models` +
++fallback chat dipakai; hasilnya tetap benar untuk 401/403 tapi pesan
+ gagalnya generik.
++
++**Sudah diport belakangan** (`internal/proxy/vertex.go` + `chat/vertex_handler.go`,
++paritas `open-sse/executors/vertex.js`): chat forwarding `vertex`/`vertex-partner`.
++Tanpa ini, generic forwarder POST base URL persis (`/v1` telanjang di
++aiplatform.googleapis.com) dan Google membalas halaman HTML 404 untuk semua
++model — `gemini-3.1-pro-preview` termasuk. Kini: SA JSON (JWT RS256 → Bearer,
++cache per client_email), ADC `authorized_user` (refresh_token grant), dan raw
++API key (express `?key=`); `vertex` lewat endpoint Gemini-native
++(`publishers/google/models` project-scoped untuk OAuth, global untuk express
++key), `vertex-partner` lewat endpoint openai-compatible
++(`endpoints/openapi/chat/completions`). Key-validate tetap generic.
+ - Hint upstream *"Legacy manual proxy fields are still accepted by API…"* tidak
+   ditampilkan: backend Go tidak punya field proxy legacy.
+ - `reorderInTx` upstream (renumber priority per provider setelah insert) tidak
+diff --git a/internal/handlers/chat/fallback.go b/internal/handlers/chat/fallback.go
+index be9ad68..741ac47 100644
+--- a/internal/handlers/chat/fallback.go
++++ b/internal/handlers/chat/fallback.go
+@@ -490,6 +490,12 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
+ 		fwdErr = exec(w, execReq)
+ 	} else if providerCfg.IsGeminiNative() {
+ 		fwdErr = h.forwardGeminiNativeRequest(ctx, w, provider, providerCfg, apiKey, connectionID, pipedBody, isStream, translateResponse, metrics, httpClient)
++	} else if isVertexProvider(provider) {
++		var psd map[string]any
++		if connData != nil {
++			psd = connData.ProviderSpecificData
++		}
++		fwdErr = h.forwardVertexRequest(ctx, w, provider, providerCfg, apiKey, pipedBody, isStream, translateResponse, metrics, httpClient, model, psd)
+ 	} else {
+ 		fwdErr = h.forwardRequest(ctx, w, providerCfg, apiKey, pipedBody, isStream, translateResponse, metrics, httpClient)
+ 	}
+@@ -535,6 +541,12 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
+ 				fwdErr = exec(w, retryReq)
+ 			} else if providerCfg.IsGeminiNative() {
+ 				fwdErr = h.forwardGeminiNativeRequest(ctx, w, provider, providerCfg, apiKey, connectionID, pipedBody, isStream, translateResponse, metrics, httpClient)
++			} else if isVertexProvider(provider) {
++				var psd map[string]any
++				if connData != nil {
++					psd = connData.ProviderSpecificData
++				}
++				fwdErr = h.forwardVertexRequest(ctx, w, provider, providerCfg, apiKey, pipedBody, isStream, translateResponse, metrics, httpClient, model, psd)
+ 			} else {
+ 				fwdErr = h.forwardRequest(ctx, w, providerCfg, apiKey, pipedBody, isStream, translateResponse, metrics, httpClient)
+ 			}
+diff --git a/internal/handlers/chat/vertex_handler.go b/internal/handlers/chat/vertex_handler.go
+new file mode 100644
+index 0000000..c425f0f
+--- /dev/null
++++ b/internal/handlers/chat/vertex_handler.go
+@@ -0,0 +1,110 @@
++package chat
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"strings"
++
++	"9router/proxy/internal/log"
++	"9router/proxy/internal/providers"
++	"9router/proxy/internal/proxy"
++)
++
++// isVertexProvider reports whether provider is the Vertex AI family. Both
++// providers ship a catalog entry (models, aliases vx/vxp) but no executor,
++// so without this branch they fall through to the generic OpenAI forwarder,
++// which POSTs the registry BaseURL verbatim — bare
++// https://aiplatform.googleapis.com — and collects Google's HTML
++// "404: The requested URL /v1 was not found" for every model.
++func isVertexProvider(provider string) bool {
++	return provider == "vertex" || provider == "vertex-partner"
++}
++
++// forwardVertexRequest routes one request to Vertex AI.
++//
++//	vertex: Gemini-native bodies; the response is Gemini-native too, so the
++//	        same handlers the antigravity lane uses translate it back.
++//	vertex-partner: an OpenAI-compatible endpoint behind a project-scoped
++//	        path — credentials are resolved here, then the generic
++//	        forwardRequest runs with the final URL baked into a cloned config.
++func (h *ChatHandler) forwardVertexRequest(
++	ctx context.Context,
++	w http.ResponseWriter,
++	provider string,
++	providerCfg *providers.ProviderConfig,
++	apiKey string,
++	body []byte,
++	isStream bool,
++	translateResponse bool,
++	metrics *streamMetrics,
++	httpClient *http.Client,
++	modelName string,
++	psd map[string]any,
++) error {
++	if provider == "vertex-partner" {
++		return h.forwardVertexPartnerRequest(ctx, w, providerCfg, apiKey, body, isStream, translateResponse, metrics, httpClient, psd)
++	}
++
++	resp, err := proxy.ForwardVertex(ctx, httpClient, providerCfg, apiKey, body, isStream, modelName, psd)
++	if err != nil {
++		return err
++	}
++
++	var bodyCloser io.Closer = resp.Body
++	defer func() {
++		if bodyCloser != nil {
++			bodyCloser.Close()
++		}
++	}()
++
++	// Vertex answers generateContent with plain Gemini JSON (no antigravity
++	// {"response": ...} wrapper) and streamGenerateContent?alt=sse with
++	// Gemini SSE — the same shapes the gemini-native handlers consume.
++	if isStream {
++		contentType := resp.Header.Get("Content-Type")
++		if !strings.HasPrefix(strings.ToLower(contentType), "text/event-stream") {
++			return h.handleGeminiNonStream(ctx, w, resp.Body, translateResponse, metrics)
++		}
++		stallReader := proxy.NewStallReaderWithContext(ctx, resp.Body, 0, provider)
++		bodyCloser = stallReader
++		return h.handleGeminiStream(ctx, w, stallReader, translateResponse, metrics)
++	}
++	return h.handleGeminiNonStream(ctx, w, resp.Body, translateResponse, metrics)
++}
++
++// forwardVertexPartnerRequest resolves the Vertex credential + project, then
++// delegates to the generic OpenAI forwarder pointed at the partner endpoint.
++func (h *ChatHandler) forwardVertexPartnerRequest(
++	ctx context.Context,
++	w http.ResponseWriter,
++	providerCfg *providers.ProviderConfig,
++	apiKey string,
++	body []byte,
++	isStream bool,
++	translateResponse bool,
++	metrics *streamMetrics,
++	httpClient *http.Client,
++	psd map[string]any,
++) error {
++	finalURL, bearer, err := proxy.PrepareVertexPartner(ctx, httpClient, providerCfg, apiKey, psd)
++	if err != nil {
++		return err
++	}
++
++	cfg := *providerCfg
++	cfg.BaseURL = finalURL
++	key := apiKey
++	if bearer != "" {
++		// OAuth lane: send the minted Bearer, not the stored credential.
++		cfg.AuthHeader = "Authorization"
++		cfg.AuthScheme = "bearer"
++		cfg.NoAuth = false
++		key = bearer
++	} else {
++		// Express key: already in the URL query — no auth header.
++		cfg.NoAuth = true
++	}
++	log.Debug("vertex", "partner request", "url", finalURL)
++	return h.forwardRequest(ctx, w, &cfg, key, body, isStream, translateResponse, metrics, httpClient)
++}
+diff --git a/internal/providers/providers.go b/internal/providers/providers.go
+index 507483f..a00df99 100644
+--- a/internal/providers/providers.go
++++ b/internal/providers/providers.go
+@@ -816,13 +816,17 @@ var KnownProviders = map[string]ProviderConfig{
+ 		AuthHeader: "Authorization",
+ 		AuthScheme: "bearer",
+ 	},
++	// Host root only — path building lives in internal/proxy/vertex.go, which
++	// appends /v1/publishers/... (express keys) or /v1/projects/... (OAuth).
++	// The old /v1 suffix here made the generic forwarder POST the bare
++	// version segment and collect Google's HTML 404 for every model.
+ 	"vertex": {
+-		BaseURL:    "https://aiplatform.googleapis.com/v1",
++		BaseURL:    "https://aiplatform.googleapis.com",
+ 		AuthHeader: "Authorization",
+ 		AuthScheme: "bearer",
+ 	},
+ 	"vertex-partner": {
+-		BaseURL:    "https://aiplatform.googleapis.com/v1",
++		BaseURL:    "https://aiplatform.googleapis.com",
+ 		AuthHeader: "Authorization",
+ 		AuthScheme: "bearer",
+ 	},
+diff --git a/internal/proxy/vertex.go b/internal/proxy/vertex.go
+new file mode 100644
+index 0000000..b5497a4
+--- /dev/null
++++ b/internal/proxy/vertex.go
+@@ -0,0 +1,582 @@
++package proxy
++
++import (
++	"context"
++	"crypto"
++	"crypto/rand"
++	"crypto/rsa"
++	"crypto/sha256"
++	"crypto/x509"
++	"encoding/base64"
++	"encoding/pem"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"regexp"
++	"strings"
++	"sync"
++	"time"
++
++	json "encoding/json/v2"
++
++	"9router/proxy/internal/constants"
++	"9router/proxy/internal/log"
++	"9router/proxy/internal/providers"
++	"9router/proxy/internal/translator"
++)
++
++// Vertex AI forwarding — port of open-sse/executors/vertex.js.
++//
++// The Go catalog registered vertex/vertex-partner (models, aliases, dashboard)
++// but never ported the executor, so a chat request fell through to the generic
++// OpenAI path and POSTed verbatim to the registry BaseURL — bare
++// https://aiplatform.googleapis.com/v1 — which is Google's HTML
++// "404: The requested URL /v1 was not found on this server." for every model,
++// gemini-3.1-pro-preview included. This file supplies the missing lane:
++//
++//	vertex         → Gemini-native bodies against publishers/google/models
++//	vertex-partner → OpenAI-compatible bodies against
++//	                 /projects/{id}/locations/global/endpoints/openapi
++//
++// Auth (upstream parity, credentials stored as the connection apiKey):
++//   - Service Account JSON (type=service_account) → RS256 JWT assertion →
++//     Bearer via the oauth2 token endpoint, cached per client_email
++//   - ADC user JSON (type=authorized_user) → refresh_token grant, cached per
++//     refresh token
++//   - anything else → raw Vertex API key, sent as ?key= (express mode)
++//
++// A pre-set connection accessToken is used as the Bearer directly.
++
++const (
++	// vertexDefaultHost is the upstream registry baseUrl. Connections may
++	// carry an older override ending in /v1; vertexBaseHost strips it.
++	vertexDefaultHost = "https://aiplatform.googleapis.com"
++
++	googleOAuthTokenURL = "https://oauth2.googleapis.com/token"
++
++	vertexCloudPlatformScope = "https://www.googleapis.com/auth/cloud-platform"
++
++	// defaultVertexLocation mirrors buildUrl's fallback for OAuth calls.
++	defaultVertexLocation = "us-central1"
++)
++
++// DefaultVertexThinkingSignature is DEFAULT_THINKING_VERTEX_SIGNATURE from
++// open-sse/config/defaultThinkingSignature.js. Vertex rejects the synthetic
++// AG/Gemini-API signatures the request translator backfills, so every
++// thoughtSignature is replaced with this Vertex-native one
++// (openai-to-vertex.js postProcessForVertex).
++const DefaultVertexThinkingSignature = "CloBjz1rX5+yg1ILh/Ag+suum5k1f/9m/hI0XDQ33lsQIYnOHLn9KZwN0C7E4jgep5MzZvz5Se1Z1xxYrA1+Iz0Il4tabBhaDfMKNa5dGdEA3KnikfjfIpMlPaAKaQGPPWtf2hodPdBgguiZqDn+Qz2LwGEqHVJ16LVBUpeSx7UnYBLSwio8cyNy0jPijOh5QXKLTeHVdO2tKKcCCrtG2JCW3dOSrW2qA8eyAg40iQUnMNECjbcjkqB1+zrab7jX9ILwg7L9OgqYAQGPPWtfT4nzaPzSkXePAa920abYxPs3fg/RHDlg8PUVFLa+ko6qOjt7nXJTMxN0cpCwUCFX7eHHcMnA6vApyA/rXvJiAABkHZ3HilAktXRtxr/thHU0H8/4H5gT3kzoQcq9aMznrKomd3ct0mFi0ioSKnOEfoY1Mrfj00p/ZWm0tT7Wrjcm3BQXZ+T9Vrb94k+6CjtcEBrGCq8BAY89a1/vTMczqwB1NP3HCCuBdnds2vDXkj6XAYaXjsjmik8tGqwMKHz8R9RAWsx6SO6pkGEpXXpRzAaUx6c+aofsL/z1xOcN7ArCAa6uEeQKEgNngZuCP05p4+9P95epVmgOjFa4KfsPnyg+NKUkEFmpPSDrIRyMT+xERlclVcCI98/u7i8a9+vTbgzl8TRFYryClNH37K1ye5i6kqSGDUcMyiEasjke5BxbUh3i6wqMAgGPPWtfk+A+iY38QAldu117FEkTIkzbYOIt67lk9c6Ou3Y3Ct8TFHFw5QwGfSFc0YWjeTFHdm9UdV5jPK35p6VfhiRSva3w2+JLIHb4jvv5HutZPOJ3yQTt/+hUDj80oMNMbwnxNZvCEdzKS+D9vwmTACAm5H0ZetBSH2gPJXnhhuQo9AegS3wIWVR2a5k643Vx9r4u4pOvij4476lxKswIHvqsjL4jnTzRCvd44G6dn7vD0ENGb1K/i+dMRQMcOBaOxPN0ynk9bKxXWRDbZ+Rhakfr+y74z+6eYCdRPVqO9I7s+riilFuRIfaQ+U6/vuVKGIWEVKCfZZi0z6H5Xgz1xmse0u0AsittDlIKxwEBjz1rX783A0vehvUeabRia+/pX46IsN5efTAxFEBUeUce3jLuXIghkMV2b8KNhUs2G0aZldDDewRQbkluQabBMDT82N5I7reJP0VZgLIKccCL5DoGv1J7YWM2npLMIgZ6aP8aSlT3PFFJ0IXbUZUrzduczmIm6nzAJf9zxmq1aIFYw8YrgW8RjUdy0UvUmRoBEShSGUrvsyaRTl7J//KJW5utIPunFMu53GPWLidCFHzM1QA3Cj1+4zv5UXajP/V92RQayWbzCvYBAY89a1+yzoVSWukUGH7kX71Tg9dx7HA7OyKYwnYaqekG98zJfcUM/3KoiiiotW5t4xYu//ksEl36bSWvUHsRnxGByg+3WYdnZqKg0AtdRB/EXbI5PsjvS5ko96bkjSuFkY3TjHGwAM2B94K6/t6OTE/NBbxCsY9sT4d+1sbFv/iyfmfCnfvJaSzGmC9CDWKy4iqQ/vBNWps9j1JXk0p5uPAYC2BaMkxl5xoTVZqI3zAuRtQF5JLmPPy+PdqOgFxMKcLGNhwp7dbhIFLF68vCYQ9CL0NnK2d3CFk1UFVYxsi1TsolR1xahe/Rxt5HZDz/z65nevrQ"
++
++// vertexServiceAccount is the subset of a Google Service Account JSON key this
++// flow needs (parseVertexSaJson upstream).
++type vertexServiceAccount struct {
++	Type        string `json:"type"`
++	ClientEmail string `json:"client_email"`
++	PrivateKey  string `json:"private_key"`
++	ProjectID   string `json:"project_id"`
++}
++
++// vertexADC is the subset of `gcloud auth application-default login`
++// credentials (parseVertexAdcJson upstream).
++type vertexADC struct {
++	Type           string `json:"type"`
++	ClientID       string `json:"client_id"`
++	ClientSecret   string `json:"client_secret"`
++	RefreshToken   string `json:"refresh_token"`
++	QuotaProjectID string `json:"quota_project_id"`
++}
++
++func parseVertexServiceAccount(apiKey string) *vertexServiceAccount {
++	if apiKey == "" {
++		return nil
++	}
++	var sa vertexServiceAccount
++	if err := json.Unmarshal([]byte(apiKey), &sa); err != nil {
++		return nil
++	}
++	if sa.Type != "service_account" || sa.ClientEmail == "" || sa.PrivateKey == "" || sa.ProjectID == "" {
++		return nil
++	}
++	return &sa
++}
++
++func parseVertexADC(apiKey string) *vertexADC {
++	if apiKey == "" {
++		return nil
++	}
++	var adc vertexADC
++	if err := json.Unmarshal([]byte(apiKey), &adc); err != nil {
++		return nil
++	}
++	if adc.Type != "authorized_user" || adc.ClientID == "" || adc.ClientSecret == "" || adc.RefreshToken == "" {
++		return nil
++	}
++	return &adc
++}
++
++// vertexBaseHost reduces any stored BaseURL (upstream registry value, or an
++// older connection override like https://aiplatform.googleapis.com/v1) to the
++// bare host, so path building below owns the whole path.
++func vertexBaseHost(base string) string {
++	host := strings.TrimRight(base, "/")
++	for _, suffix := range []string{"/v1beta/openai", "/v1beta", "/v1"} {
++		host = strings.TrimSuffix(host, suffix)
++	}
++	if host == "" || !strings.HasPrefix(host, "http://") && !strings.HasPrefix(host, "https://") {
++		return vertexDefaultHost
++	}
++	return host
++}
++
++// vertexAuth is the resolved credential set for one request.
++type vertexAuth struct {
++	// bearer is the OAuth access token (SA-minted, ADC-refreshed, or the
++	// connection's pre-set accessToken). Empty for raw-key mode.
++	bearer string
++	// rawKey is the express-mode API key sent as ?key=. Empty for OAuth.
++	rawKey string
++	// projectID is required for every OAuth call and for vertex-partner.
++	projectID string
++	// location is the regional endpoint segment (OAuth calls only).
++	location string
++}
++
++func (a *vertexAuth) oauth() bool { return a.bearer != "" }
++
++// psdString pulls a string out of providerSpecificData.
++func psdString(psd map[string]any, key string) string {
++	if psd == nil {
++		return ""
++	}
++	s, _ := psd[key].(string)
++	return s
++}
++
++// resolveVertexAuth classifies the connection credential and mints/refreshes
++// the Bearer when the stored credential is an SA or ADC JSON.
++func resolveVertexAuth(ctx context.Context, client *http.Client, apiKey string, psd map[string]any) (*vertexAuth, error) {
++	auth := &vertexAuth{
++		location: psdString(psd, "location"),
++	}
++	if auth.location == "" {
++		auth.location = defaultVertexLocation
++	}
++	if pid := psdString(psd, "projectId"); pid != "" {
++		auth.projectID = pid
++	}
++
++	switch {
++	case parseVertexServiceAccount(apiKey) != nil:
++		sa := parseVertexServiceAccount(apiKey)
++		tok, err := mintVertexSAToken(ctx, client, sa)
++		if err != nil {
++			return nil, err
++		}
++		auth.bearer = tok
++		auth.projectID = sa.ProjectID
++	case parseVertexADC(apiKey) != nil:
++		adc := parseVertexADC(apiKey)
++		tok, err := refreshVertexADCToken(ctx, client, adc)
++		if err != nil {
++			return nil, err
++		}
++		auth.bearer = tok
++		if adc.QuotaProjectID != "" && auth.projectID == "" {
++			auth.projectID = adc.QuotaProjectID
++		}
++	default:
++		// Not JSON (or not a recognized credential shape): an explicit
++		// accessToken rides as Bearer, anything else is an express key.
++		if isLikelyAccessToken(apiKey) {
++			auth.bearer = apiKey
++		} else {
++			auth.rawKey = apiKey
++		}
++	}
++	return auth, nil
++}
++
++// isLikelyAccessToken reports whether apiKey looks like a pre-minted OAuth
++// bearer rather than an express-mode API key. Express keys are short
++// alphanumeric strings; every Google bearer shape (JWT or gcloud-printed
++// token) either carries dots or is too long for a key. Ambiguity is
++// harmless: a key sent as Bearer fails auth clearly, and upstream has the
++// same binary split.
++func isLikelyAccessToken(s string) bool {
++	return strings.Count(s, ".") >= 2 || len(s) > 120
++}
++
++// Token caches. Upstream keeps these in tokenRefresh.js with a 5-minute
++// early-expiry margin; entries are keyed by credential identity.
++type vertexCachedToken struct {
++	token     string
++	expiresAt time.Time
++}
++
++var (
++	vertexSATokenMu  sync.Mutex
++	vertexSATokens   = map[string]vertexCachedToken{} // client_email → token
++	vertexADCTokenMu sync.Mutex
++	vertexADCTokens  = map[string]vertexCachedToken{} // refresh_token → token
++)
++
++const vertexTokenRefreshLead = 5 * time.Minute
++
++func cachedVertexToken(m map[string]vertexCachedToken, mu *sync.Mutex, key string) string {
++	mu.Lock()
++	defer mu.Unlock()
++	e, ok := m[key]
++	if !ok || time.Now().After(e.expiresAt.Add(-vertexTokenRefreshLead)) {
++		return ""
++	}
++	return e.token
++}
++
++func storeVertexToken(m map[string]vertexCachedToken, mu *sync.Mutex, key, token string, expiresIn int) {
++	if expiresIn <= 0 {
++		expiresIn = 3600
++	}
++	mu.Lock()
++	m[key] = vertexCachedToken{token: token, expiresAt: time.Now().Add(time.Duration(expiresIn) * time.Second)}
++	mu.Unlock()
++}
++
++// signVertexJWT builds the RS256 assertion for the SA grant
++// (refreshVertexToken's jose SignJWT block).
++func signVertexJWT(sa *vertexServiceAccount, now time.Time) (string, error) {
++	// Upstream parity: private_key.replace(/\\n/g, "\n") — a key stored with
++	// double-escaped newlines still decodes; a JSON-parsed one (real newlines)
++	// is untouched.
++	keyPEM := strings.ReplaceAll(sa.PrivateKey, `\n`, "\n")
++	block, _ := pem.Decode([]byte(keyPEM))
++	if block == nil {
++		return "", fmt.Errorf("vertex: service account private_key is not valid PEM")
++	}
++	keyAny, err := x509.ParsePKCS8PrivateKey(block.Bytes)
++	if err != nil {
++		return "", fmt.Errorf("vertex: parse service account private key: %w", err)
++	}
++	key, ok := keyAny.(*rsa.PrivateKey)
++	if !ok {
++		return "", fmt.Errorf("vertex: service account private key is not RSA")
++	}
++
++	claim := func(v any) string {
++		b, _ := json.Marshal(v)
++		return base64.RawURLEncoding.EncodeToString(b)
++	}
++	iat := now.Unix()
++	header := claim(map[string]string{"alg": "RS256", "typ": "JWT"})
++	claims := claim(map[string]any{
++		"iss":   sa.ClientEmail,
++		"scope": vertexCloudPlatformScope,
++		"aud":   googleOAuthTokenURL,
++		"iat":   iat,
++		"exp":   iat + 3600,
++	})
++	signingInput := header + "." + claims
++	digest := sha256.Sum256([]byte(signingInput))
++	sig, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, digest[:])
++	if err != nil {
++		return "", fmt.Errorf("vertex: sign JWT: %w", err)
++	}
++	return signingInput + "." + base64.RawURLEncoding.EncodeToString(sig), nil
++}
++
++func mintVertexSAToken(ctx context.Context, client *http.Client, sa *vertexServiceAccount) (string, error) {
++	if tok := cachedVertexToken(vertexSATokens, &vertexSATokenMu, sa.ClientEmail); tok != "" {
++		return tok, nil
++	}
++	jwt, err := signVertexJWT(sa, time.Now())
++	if err != nil {
++		return "", err
++	}
++	form := url.Values{
++		"grant_type": {"urn:ietf:params:oauth:grant-type:jwt-bearer"},
++		"assertion":  {jwt},
++	}
++	tok, expiresIn, err := postGoogleTokenEndpoint(ctx, client, form)
++	if err != nil {
++		return "", fmt.Errorf("vertex: failed to mint access token from Service Account JSON: %w", err)
++	}
++	storeVertexToken(vertexSATokens, &vertexSATokenMu, sa.ClientEmail, tok, expiresIn)
++	return tok, nil
++}
++
++func refreshVertexADCToken(ctx context.Context, client *http.Client, adc *vertexADC) (string, error) {
++	if tok := cachedVertexToken(vertexADCTokens, &vertexADCTokenMu, adc.RefreshToken); tok != "" {
++		return tok, nil
++	}
++	form := url.Values{
++		"grant_type":    {"refresh_token"},
++		"refresh_token": {adc.RefreshToken},
++		"client_id":     {adc.ClientID},
++		"client_secret": {adc.ClientSecret},
++	}
++	tok, expiresIn, err := postGoogleTokenEndpoint(ctx, client, form)
++	if err != nil {
++		return "", fmt.Errorf("vertex: failed to refresh access token from ADC JSON (authorized_user): %w", err)
++	}
++	storeVertexToken(vertexADCTokens, &vertexADCTokenMu, adc.RefreshToken, tok, expiresIn)
++	return tok, nil
++}
++
++func postGoogleTokenEndpoint(ctx context.Context, client *http.Client, form url.Values) (token string, expiresIn int, err error) {
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, googleOAuthTokenURL,
++		strings.NewReader(form.Encode()))
++	if err != nil {
++		return "", 0, err
++	}
++	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
++	if client == nil {
++		client = http.DefaultClient
++	}
++	resp, err := client.Do(req)
++	if err != nil {
++		return "", 0, err
++	}
++	defer resp.Body.Close()
++	body, err := io.ReadAll(io.LimitReader(resp.Body, constants.UpstreamErrLimit))
++	if err != nil {
++		return "", 0, err
++	}
++	if resp.StatusCode != http.StatusOK {
++		return "", 0, fmt.Errorf("token endpoint returned %d: %s", resp.StatusCode, truncateErrBody(body))
++	}
++	var parsed struct {
++		AccessToken string `json:"access_token"`
++		ExpiresIn   int    `json:"expires_in"`
++	}
++	if err := json.Unmarshal(body, &parsed); err != nil {
++		return "", 0, fmt.Errorf("parse token response: %w", err)
++	}
++	if parsed.AccessToken == "" {
++		return "", 0, fmt.Errorf("empty access token in refresh response")
++	}
++	return parsed.AccessToken, parsed.ExpiresIn, nil
++}
++
++func truncateErrBody(b []byte) string {
++	if len(b) > 500 {
++		return string(b[:500])
++	}
++	return string(b)
++}
++
++// ── Project ID resolution (vertex-partner raw keys) ─────────────────────────
++
++var vertexProjectRe = regexp.MustCompile(`projects/([^/]+)/`)
++
++var (
++	vertexProjectMu    sync.Mutex
++	vertexProjectCache = map[string]string{} // raw key → project id
++)
++
++// resolveVertexProjectID ports resolveProjectId: express keys don't carry a
++// project, so a deliberately-invalid probe request is sent and the project is
++// parsed out of Google's error text.
++func resolveVertexProjectID(ctx context.Context, client *http.Client, rawKey string) (string, error) {
++	vertexProjectMu.Lock()
++	pid := vertexProjectCache[rawKey]
++	vertexProjectMu.Unlock()
++	if pid != "" {
++		return pid, nil
++	}
++
++	probeURL := vertexDefaultHost + "/v1/publishers/google/models/__probe__:generateContent?key=" + url.QueryEscape(rawKey)
++	resp, err := DoRequest(ctx, client, http.MethodPost, probeURL, map[string]string{"Content-Type": "application/json"}, []byte("{}"))
++	if err != nil {
++		return "", fmt.Errorf("vertex: project probe request failed: %w", err)
++	}
++	body, _ := io.ReadAll(io.LimitReader(resp.Body, constants.UpstreamErrLimit))
++	resp.Body.Close()
++	var parsed struct {
++		Error struct {
++			Message string `json:"message"`
++		} `json:"error"`
++	}
++	_ = json.Unmarshal(body, &parsed)
++	if m := vertexProjectRe.FindStringSubmatch(parsed.Error.Message); m != nil {
++		vertexProjectMu.Lock()
++		vertexProjectCache[rawKey] = m[1]
++		vertexProjectMu.Unlock()
++		return m[1], nil
++	}
++	return "", fmt.Errorf("vertex: could not resolve project_id from API key. Please add it manually in provider settings")
++}
++
++// ── URL builders (buildUrl parity) ──────────────────────────────────────────
++
++// vertexGeminiURL builds the generateContent URL for provider "vertex".
++// OAuth credentials must use the project-scoped regional path
++// (RESOURCE_PROJECT_INVALID otherwise); express keys use the global
++// publishers endpoint with ?key=.
++func vertexGeminiURL(host string, model string, isStream bool, auth *vertexAuth) string {
++	action := "generateContent"
++	if isStream {
++		action = "streamGenerateContent"
++	}
++	if auth.oauth() {
++		u := fmt.Sprintf("%s/v1/projects/%s/locations/%s/publishers/google/models/%s:%s",
++			host, auth.projectID, auth.location, model, action)
++		if isStream {
++			u += "?alt=sse"
++		}
++		return u
++	}
++	u := fmt.Sprintf("%s/v1/publishers/google/models/%s:%s", host, model, action)
++	sep := "?"
++	if isStream {
++		u += "?alt=sse"
++		sep = "&"
++	}
++	if auth.rawKey != "" {
++		u += sep + "key=" + url.QueryEscape(auth.rawKey)
++	}
++	return u
++}
++
++// VertexPartnerChatURL builds the OpenAI-compatible endpoint for provider
++// "vertex-partner" (global openapi endpoint). Partner models require a
++// project id regardless of auth method.
++func VertexPartnerChatURL(host string, auth *vertexAuth) (string, error) {
++	if auth.projectID == "" {
++		return "", fmt.Errorf("vertex-partner: could not resolve project_id from API key. Please add it manually in provider settings")
++	}
++	u := fmt.Sprintf("%s/v1/projects/%s/locations/global/endpoints/openapi/chat/completions", host, auth.projectID)
++	if auth.rawKey != "" {
++		u += "?key=" + url.QueryEscape(auth.rawKey)
++	}
++	return u, nil
++}
++
++// ── Request body post-processing (openai-to-vertex.js parity) ───────────────
++
++// postProcessVertexBody adapts a Gemini-format body to Vertex: replace every
++// thoughtSignature with the Vertex-native one and strip the id from
++// functionCall/functionResponse parts (Vertex rejects ids).
++func postProcessVertexBody(body []byte) []byte {
++	var parsed struct {
++		Contents []struct {
++			Parts []map[string]any `json:"parts"`
++		} `json:"contents"`
++	}
++	if err := json.Unmarshal(body, &parsed); err != nil {
++		return body
++	}
++	changed := false
++	for _, turn := range parsed.Contents {
++		for _, part := range turn.Parts {
++			// Only rewrite on a real difference: a body that is already
++			// Vertex-processed (default signature, ids gone) must pass through
++			// byte-identical, not be re-serialized on every request.
++			if sig, ok := part["thoughtSignature"].(string); ok && sig != DefaultVertexThinkingSignature {
++				part["thoughtSignature"] = DefaultVertexThinkingSignature
++				changed = true
++			}
++			if fc, ok := part["functionCall"].(map[string]any); ok {
++				if _, has := fc["id"]; has {
++					delete(fc, "id")
++					changed = true
++				}
++			}
++			if fr, ok := part["functionResponse"].(map[string]any); ok {
++				if _, has := fr["id"]; has {
++					delete(fr, "id")
++					changed = true
++				}
++			}
++		}
++	}
++	if !changed {
++		return body
++	}
++	out, err := json.Marshal(parsed)
++	if err != nil {
++		return body
++	}
++	return out
++}
++
++// ── Entry points ────────────────────────────────────────────────────────────
++
++// PrepareVertexPartner resolves credentials for provider "vertex-partner" and
++// returns the final chat URL plus the credential the generic OpenAI forwarder
++// must send: the Bearer token for OAuth lanes, or "" (the key rides in the
++// URL, so the caller marks the config NoAuth).
++func PrepareVertexPartner(ctx context.Context, client *http.Client, cfg *providers.ProviderConfig, apiKey string, psd map[string]any) (finalURL, bearer string, err error) {
++	auth, err := resolveVertexAuth(ctx, client, apiKey, psd)
++	if err != nil {
++		return "", "", err
++	}
++	if !auth.oauth() && auth.rawKey != "" && auth.projectID == "" {
++		// Express key without a hand-set project: probe once, cache forever.
++		pid, perr := resolveVertexProjectID(ctx, client, auth.rawKey)
++		if perr != nil {
++			return "", "", perr
++		}
++		auth.projectID = pid
++	}
++	finalURL, err = VertexPartnerChatURL(vertexBaseHost(cfg.BaseURL), auth)
++	if err != nil {
++		return "", "", err
++	}
++	return finalURL, auth.bearer, nil
++}
++
++// ForwardVertex sends an OpenAI-format request to Vertex AI (provider
++// "vertex") as a Gemini-native generateContent call, returning the upstream
++// response. Non-200 answers come back as *UpstreamError.
++func ForwardVertex(ctx context.Context, client *http.Client, cfg *providers.ProviderConfig, apiKey string, body []byte, isStream bool, modelName string, psd map[string]any) (*http.Response, error) {
++	if modelName == "" {
++		// Extract model from the OpenAI body when the caller didn't say.
++		var reqMeta struct {
++			Model string `json:"model"`
++		}
++		if err := json.Unmarshal(body, &reqMeta); err == nil {
++			modelName = reqMeta.Model
++		}
++	}
++
++	auth, err := resolveVertexAuth(ctx, client, apiKey, psd)
++	if err != nil {
++		return nil, err
++	}
++	if auth.oauth() && auth.projectID == "" {
++		return nil, fmt.Errorf("vertex: OAuth/ADC requires a project_id. Add quota_project_id to your ADC JSON or set providerSpecificData.projectId")
++	}
++
++	geminiBody, err := translator.TranslateOpenAIToGemini(body)
++	if err != nil {
++		return nil, fmt.Errorf("translate to Gemini: %w", err)
++	}
++	sendBody := postProcessVertexBody(geminiBody)
++
++	requestURL := vertexGeminiURL(vertexBaseHost(cfg.BaseURL), modelName, isStream, auth)
++
++	headers := map[string]string{
++		"Content-Type": "application/json",
++	}
++	if auth.oauth() {
++		headers["Authorization"] = "Bearer " + auth.bearer
++	}
++	if isStream {
++		headers["Accept"] = "text/event-stream"
++	}
++
++	resp, err := DoRequest(ctx, client, http.MethodPost, requestURL, headers, sendBody)
++	if err != nil {
++		return nil, fmt.Errorf("upstream request: %w", err)
++	}
++	if resp.StatusCode != http.StatusOK {
++		errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, constants.UpstreamErrLimit))
++		resp.Body.Close()
++		if readErr != nil {
++			return nil, fmt.Errorf("upstream returned %d and body read failed: %w", resp.StatusCode, readErr)
++		}
++		log.Warn("vertex", "upstream error", "model", modelName, "status", resp.StatusCode, "body", truncateErrBody(errBody))
++		return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: errBody, Header: resp.Header}
++	}
++	return resp, nil
++}
+diff --git a/internal/proxy/vertex_test.go b/internal/proxy/vertex_test.go
+new file mode 100644
+index 0000000..3f735b0
+--- /dev/null
++++ b/internal/proxy/vertex_test.go
+@@ -0,0 +1,238 @@
++package proxy
++
++import (
++	"strings"
++	"testing"
++
++	json "encoding/json/v2"
++	"encoding/json/jsontext"
++)
++
++// Tests for patches/0004: the vertex/vertex-partner forwarding lane. Without
++// it the generic OpenAI forwarder POSTed the registry BaseURL verbatim and
++// Google answered with its HTML "404: The requested URL /v1 was not found"
++// page for every Vertex model (gemini-3.1-pro-preview included).
++
++func TestVertexBaseHostStripsVersionSuffixes(t *testing.T) {
++	cases := []struct{ in, want string }{
++		{"https://aiplatform.googleapis.com", "https://aiplatform.googleapis.com"},
++		{"https://aiplatform.googleapis.com/", "https://aiplatform.googleapis.com"},
++		{"https://aiplatform.googleapis.com/v1", "https://aiplatform.googleapis.com"},
++		{"https://aiplatform.googleapis.com/v1/", "https://aiplatform.googleapis.com"},
++		{"https://aiplatform.googleapis.com/v1beta", "https://aiplatform.googleapis.com"},
++		{"https://aiplatform.googleapis.com/v1beta/openai", "https://aiplatform.googleapis.com"},
++		// Overrides pointing at generativelanguage still get a sane host.
++		{"https://generativelanguage.googleapis.com/v1beta/openai", "https://generativelanguage.googleapis.com"},
++		{"", vertexDefaultHost},
++		{"not a url", vertexDefaultHost},
++	}
++	for _, c := range cases {
++		if got := vertexBaseHost(c.in); got != c.want {
++			t.Errorf("vertexBaseHost(%q) = %q, want %q", c.in, got, c.want)
++		}
++	}
++}
++
++func TestParseVertexServiceAccountShape(t *testing.T) {
++	ok := `{"type":"service_account","client_email":"sa@proj.iam.gserviceaccount.com","private_key":"-----BEGIN PRIVATE KEY-----\nX\n-----END PRIVATE KEY-----\n","project_id":"proj-1"}`
++	if sa := parseVertexServiceAccount(ok); sa == nil {
++		t.Fatal("valid SA JSON rejected")
++	} else if sa.ProjectID != "proj-1" || sa.ClientEmail != "sa@proj.iam.gserviceaccount.com" {
++		t.Fatalf("parsed fields wrong: %+v", sa)
++	}
++	bad := []string{
++		"",
++		"raw-vertex-api-key",
++		`{"type":"authorized_user","client_id":"a","client_secret":"b","refresh_token":"c"}`,
++		`{"type":"service_account","client_email":"sa@proj.iam.gserviceaccount.com","private_key":"key"}`, // no project_id
++	}
++	for _, b := range bad {
++		if sa := parseVertexServiceAccount(b); sa != nil {
++			t.Errorf("parseVertexServiceAccount(%q) accepted invalid input", b)
++		}
++	}
++}
++
++func TestParseVertexADCShape(t *testing.T) {
++	ok := `{"type":"authorized_user","client_id":"cid","client_secret":"sec","refresh_token":"rt","quota_project_id":"qp"}`
++	if adc := parseVertexADC(ok); adc == nil {
++		t.Fatal("valid ADC JSON rejected")
++	} else if adc.QuotaProjectID != "qp" {
++		t.Fatalf("quota project lost: %+v", adc)
++	}
++	if adc := parseVertexADC(`{"type":"service_account","client_email":"e","private_key":"k","project_id":"p"}`); adc != nil {
++		t.Fatal("SA JSON accepted as ADC")
++	}
++}
++
++func TestVertexGeminiURLExpressKey(t *testing.T) {
++	auth := &vertexAuth{rawKey: "AIzakey/+"}
++	got := vertexGeminiURL("https://aiplatform.googleapis.com", "gemini-3.1-pro-preview", false, auth)
++	want := "https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-3.1-pro-preview:generateContent?key=AIzakey%2F%2B"
++	if got != want {
++		t.Fatalf("non-stream express URL = %q, want %q", got, want)
++	}
++	got = vertexGeminiURL("https://aiplatform.googleapis.com", "gemini-3.1-pro-preview", true, auth)
++	want = "https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-3.1-pro-preview:streamGenerateContent?alt=sse&key=AIzakey%2F%2B"
++	if got != want {
++		t.Fatalf("stream express URL = %q, want %q", got, want)
++	}
++}
++
++func TestVertexGeminiURLOAuthProjectScoped(t *testing.T) {
++	auth := &vertexAuth{bearer: "tok", projectID: "proj-9", location: "europe-west4"}
++	got := vertexGeminiURL("https://aiplatform.googleapis.com", "gemini-3.1-pro-preview", false, auth)
++	want := "https://aiplatform.googleapis.com/v1/projects/proj-9/locations/europe-west4/publishers/google/models/gemini-3.1-pro-preview:generateContent"
++	if got != want {
++		t.Fatalf("oauth URL = %q, want %q", got, want)
++	}
++	got = vertexGeminiURL("https://aiplatform.googleapis.com", "gemini-3.1-pro-preview", true, auth)
++	if !strings.HasSuffix(got, "?alt=sse") {
++		t.Fatalf("stream oauth URL missing ?alt=sse: %q", got)
++	}
++	if strings.Contains(got, "key=") {
++		t.Fatalf("oauth URL must not carry a key param: %q", got)
++	}
++}
++
++func TestVertexPartnerChatURL(t *testing.T) {
++	auth := &vertexAuth{bearer: "tok", projectID: "proj-9"}
++	got, err := VertexPartnerChatURL("https://aiplatform.googleapis.com", auth)
++	if err != nil {
++		t.Fatalf("oauth partner URL: %v", err)
++	}
++	want := "https://aiplatform.googleapis.com/v1/projects/proj-9/locations/global/endpoints/openapi/chat/completions"
++	if got != want {
++		t.Fatalf("partner oauth URL = %q, want %q", got, want)
++	}
++
++	raw := &vertexAuth{rawKey: "k", projectID: "proj-9"}
++	got, err = VertexPartnerChatURL("https://aiplatform.googleapis.com", raw)
++	if err != nil || !strings.HasSuffix(got, "?key=k") {
++		t.Fatalf("partner raw URL = %q err=%v", got, err)
++	}
++
++	noProject := &vertexAuth{rawKey: "k"}
++	if _, err := VertexPartnerChatURL("https://aiplatform.googleapis.com", noProject); err == nil {
++		t.Fatal("partner URL without project must error")
++	}
++}
++
++// postProcessVertexBody must mirror openai-to-vertex.js: replace every
++// thoughtSignature with the Vertex default and strip functionCall /
++// functionResponse ids.
++func TestPostProcessVertexBodyStripsIDsAndReplacesSignature(t *testing.T) {
++	in := []byte(`{"contents":[
++		{"role":"model","parts":[{"functionCall":{"name":"fs_read","id":"call_1","args":{"p":1}},"thoughtSignature":"AGSIG"}]},
++		{"role":"user","parts":[{"functionResponse":{"name":"fs_read","id":"call_1","response":{"result":"ok"}}}]}
++	]}`)
++	out := postProcessVertexBody(in)
++
++	var body struct {
++		Contents []struct {
++			Parts []jsontext.Value `json:"parts"`
++		} `json:"contents"`
++	}
++	if err := json.Unmarshal(out, &body); err != nil {
++		t.Fatalf("reparse: %v", err)
++	}
++	if len(body.Contents) != 2 {
++		t.Fatalf("contents lost: %s", out)
++	}
++
++	var callPart, respPart map[string]any
++	if err := json.Unmarshal([]byte(body.Contents[0].Parts[0]), &callPart); err != nil {
++		t.Fatal(err)
++	}
++	if err := json.Unmarshal([]byte(body.Contents[1].Parts[0]), &respPart); err != nil {
++		t.Fatal(err)
++	}
++
++	if sig, _ := callPart["thoughtSignature"].(string); sig != DefaultVertexThinkingSignature {
++		t.Fatalf("thoughtSignature not replaced with vertex default: %.40s", sig)
++	}
++	call, _ := callPart["functionCall"].(map[string]any)
++	if call == nil {
++		t.Fatalf("functionCall lost: %v", callPart)
++	}
++	if _, has := call["id"]; has {
++		t.Fatalf("functionCall.id not stripped: %v", call)
++	}
++	if call["name"] != "fs_read" {
++		t.Fatalf("functionCall.name lost: %v", call)
++	}
++	resp, _ := respPart["functionResponse"].(map[string]any)
++	if resp == nil {
++		t.Fatalf("functionResponse lost: %v", respPart)
++	}
++	if _, has := resp["id"]; has {
++		t.Fatalf("functionResponse.id not stripped: %v", resp)
++	}
++
++	// Idempotent: a second pass must not change anything.
++	if again := postProcessVertexBody(out); string(again) != string(out) {
++		t.Fatalf("postProcess not idempotent:\n once=%s\n twice=%s", out, again)
++	}
++}
++
++func TestPostProcessVertexBodyUntouchedWithoutMarkers(t *testing.T) {
++	in := []byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`)
++	if out := postProcessVertexBody(in); string(out) != string(in) {
++		t.Fatalf("clean body was rewritten: %s", out)
++	}
++}
++
++func TestSignVertexJWTShape(t *testing.T) {
++	// An RSA key generated for the test — 2048-bit PKCS#8 PEM with literal
++	// \n escapes exactly as a Service Account JSON stores it.
++	pemKey := generateTestRSAPrivateKeyPEM(t)
++	sa := &vertexServiceAccount{
++		Type:        "service_account",
++		ClientEmail: "sa@proj.iam.gserviceaccount.com",
++		PrivateKey:  strings.ReplaceAll(pemKey, "\n", "\\n"),
++		ProjectID:   "proj-1",
++	}
++	jwt, err := signVertexJWT(sa, testNow())
++	if err != nil {
++		t.Fatalf("signVertexJWT: %v", err)
++	}
++	parts := strings.Split(jwt, ".")
++	if len(parts) != 3 {
++		t.Fatalf("jwt has %d parts, want 3", len(parts))
++	}
++	var header struct {
++		Alg string `json:"alg"`
++		Typ string `json:"typ"`
++	}
++	var claims struct {
++		Iss   string `json:"iss"`
++		Scope string `json:"scope"`
++		Aud   string `json:"aud"`
++		Exp   int64  `json:"exp"`
++		Iat   int64  `json:"iat"`
++	}
++	decode := func(s string, v any) {
++		t.Helper()
++		raw, err := base64RawURLDecode(s)
++		if err != nil {
++			t.Fatalf("decode segment: %v", err)
++		}
++		if err := json.Unmarshal(raw, v); err != nil {
++			t.Fatalf("unmarshal segment %s: %v", s, v)
++		}
++	}
++	decode(parts[0], &header)
++	decode(parts[1], &claims)
++	if header.Alg != "RS256" || header.Typ != "JWT" {
++		t.Fatalf("header = %+v", header)
++	}
++	if claims.Iss != sa.ClientEmail || claims.Aud != googleOAuthTokenURL {
++		t.Fatalf("claims = %+v", claims)
++	}
++	if claims.Scope != vertexCloudPlatformScope {
++		t.Fatalf("scope = %q", claims.Scope)
++	}
++	if claims.Exp-claims.Iat != 3600 {
++		t.Fatalf("exp-iat = %d, want 3600", claims.Exp-claims.Iat)
++	}
++}
+diff --git a/internal/proxy/vertex_testhelpers_test.go b/internal/proxy/vertex_testhelpers_test.go
+new file mode 100644
+index 0000000..86186a1
+--- /dev/null
++++ b/internal/proxy/vertex_testhelpers_test.go
+@@ -0,0 +1,36 @@
++package proxy
++
++import (
++	"crypto/rand"
++	"crypto/rsa"
++	"crypto/x509"
++	"encoding/base64"
++	"encoding/pem"
++	"testing"
++	"time"
++)
++
++// Test helpers for vertex_test.go.
++
++func base64RawURLDecode(s string) ([]byte, error) {
++	return base64.RawURLEncoding.DecodeString(s)
++}
++
++func testNow() time.Time {
++	return time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
++}
++
++// generateTestRSAPrivateKeyPEM returns a throwaway 2048-bit private key in
++// PKCS#8 PEM form — the same encoding a Service Account JSON carries.
++func generateTestRSAPrivateKeyPEM(t *testing.T) string {
++	t.Helper()
++	key, err := rsa.GenerateKey(rand.Reader, 2048)
++	if err != nil {
++		t.Fatalf("generate rsa key: %v", err)
++	}
++	der, err := x509.MarshalPKCS8PrivateKey(key)
++	if err != nil {
++		t.Fatalf("marshal pkcs8: %v", err)
++	}
++	return string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))
++}
