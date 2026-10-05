@@ -1,0 +1,146 @@
+From dfb829bc8757183b48c479af77900afb710864bd Mon Sep 17 00:00:00 2001
+From: razgulay <bantran09@outlook.com>
+Date: Mon, 5 Oct 2026 21:46:36 +0700
+Subject: [PATCH 11/11] =?UTF-8?q?feat(debug):=20GEMINI=5FSTREAM=5FDEBUG=20?=
+ =?UTF-8?q?=E2=80=94=20raw=20wire=20capture=20for=20the=20gemini-native=20?=
+ =?UTF-8?q?lanes?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Tool-call text leakage reports on ag/gemini-3.8-flash (analysis tokens
+surfacing in the visible content channel instead of a thought block)
+cannot be fixed blind: the Go classifier matches the upstream JS exactly
+(thought===true -> reasoning, else content, snake_case signatures
+covered), so if 3.8 emits its analysis without the thought flag, the
+reference implementation leaks identically — the containment has to be
+model-specific and evidence-based.
+
+GEMINI_STREAM_DEBUG=<dir> turns on per-request capture: every raw
+upstream SSE chunk and its translated OpenAI frame land in
+<dir>/gemini-stream-*.log as RAW/OUT pairs, with capped previews on the
+debug log for log-only deployments. Nil-receiver no-op when unset.
+---
+ internal/handlers/chat/gemini_handler.go      |  6 ++
+ internal/handlers/chat/gemini_stream_debug.go | 81 +++++++++++++++++++
+ 2 files changed, 87 insertions(+)
+ create mode 100644 internal/handlers/chat/gemini_stream_debug.go
+
+diff --git a/internal/handlers/chat/gemini_handler.go b/internal/handlers/chat/gemini_handler.go
+index 5270a41..d929018 100644
+--- a/internal/handlers/chat/gemini_handler.go
++++ b/internal/handlers/chat/gemini_handler.go
+@@ -497,6 +497,10 @@ func (h *ChatHandler) handleGeminiStream(ctx context.Context, w http.ResponseWri
+ 		translator.ClearStreamState(sessionKey)
+ 	}()
+ 
++	// GEMINI_STREAM_DEBUG wire capture — nil (and free) unless the env is set.
++	capture := startGeminiStreamCapture()
++	defer capture.close()
++
+ 	var totalChunks int
+ 	var totalBytesWritten int
+ 	err := proxy.ScanStream(upstream, func(chunk []byte) {
+@@ -507,6 +511,7 @@ func (h *ChatHandler) handleGeminiStream(ctx context.Context, w http.ResponseWri
+ 
+ 		// Unwrap antigravity envelope if present (SSE chunks may be wrapped as {"response": {...}})
+ 		unwrapped := translator.UnwrapAntigravityResponse(chunk)
++		capture.raw(unwrapped)
+ 
+ 		// Translate each Gemini SSE chunk to OpenAI SSE chunk
+ 		openaiChunk, err := translator.TranslateGeminiChunkToOpenAI(unwrapped, geminiState)
+@@ -517,6 +522,7 @@ func (h *ChatHandler) handleGeminiStream(ctx context.Context, w http.ResponseWri
+ 		if openaiChunk == nil {
+ 			return
+ 		}
++		capture.out(openaiChunk)
+ 
+ 		totalChunks++
+ 		if metrics.TTFT == 0 {
+diff --git a/internal/handlers/chat/gemini_stream_debug.go b/internal/handlers/chat/gemini_stream_debug.go
+new file mode 100644
+index 0000000..3ad7fce
+--- /dev/null
++++ b/internal/handlers/chat/gemini_stream_debug.go
+@@ -0,0 +1,81 @@
++package chat
++
++import (
++	"fmt"
++	"os"
++	"strings"
++
++	"9router/proxy/internal/log"
++)
++
++// Raw stream capture for the Gemini-native lanes (antigravity, gemini-cli,
++// vertex). Off unless GEMINI_STREAM_DEBUG names a directory (or is set to
++// any non-empty value, in which case the OS temp dir is used). When on,
++// every raw upstream SSE chunk and its translated OpenAI frame are appended
++// to <dir>/gemini-stream-*.log as RAW/OUT line pairs, so a wire-format quirk
++// — a newer Gemini marking its analysis without thought:true, an
++// antigravity envelope oddity, tool-call framing — is diagnosed against the
++// exact bytes instead of guesswork. Per-chunk previews also go to the debug
++// log (capped), so log-only deployments can be read straight from the
++// dashboard with LOG_LEVEL=debug.
++//
++// Zero overhead when the env is unset: the capture handle is nil and every
++// call is a nil-receiver check.
++
++const geminiStreamDebugPreview = 1500
++
++var geminiStreamDebugDir = strings.TrimSpace(os.Getenv("GEMINI_STREAM_DEBUG"))
++
++type geminiStreamCapture struct {
++	f *os.File
++}
++
++func startGeminiStreamCapture() *geminiStreamCapture {
++	if geminiStreamDebugDir == "" {
++		return nil
++	}
++	dir := geminiStreamDebugDir
++	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
++		dir = os.TempDir()
++	}
++	f, err := os.CreateTemp(dir, "gemini-stream-*.log")
++	if err != nil {
++		log.Warn("gemini-debug", "capture disabled, cannot create dump file", "error", err)
++		return nil
++	}
++	return &geminiStreamCapture{f: f}
++}
++
++// raw records one upstream (Gemini-format) SSE chunk.
++func (c *geminiStreamCapture) raw(chunk []byte) {
++	if c == nil || c.f == nil {
++		return
++	}
++	fmt.Fprintf(c.f, "RAW %s\n", chunk)
++	log.Debug("gemini-debug", "raw gemini chunk", "preview", geminiDebugPreview(chunk))
++}
++
++// out records the OpenAI frame the chunk translated to.
++func (c *geminiStreamCapture) out(frame []byte) {
++	if c == nil || c.f == nil {
++		return
++	}
++	fmt.Fprintf(c.f, "OUT %s\n", frame)
++	log.Debug("gemini-debug", "translated openai frame", "preview", geminiDebugPreview(frame))
++}
++
++func (c *geminiStreamCapture) close() {
++	if c == nil || c.f == nil {
++		return
++	}
++	name := c.f.Name()
++	c.f.Close()
++	log.Debug("gemini-debug", "stream capture written", "file", name)
++}
++
++func geminiDebugPreview(b []byte) string {
++	if len(b) > geminiStreamDebugPreview {
++		return string(b[:geminiStreamDebugPreview]) + "...(truncated)"
++	}
++	return string(b)
++}

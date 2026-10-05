@@ -74,6 +74,7 @@ RUN apk add --no-cache curl tar patch \
  && grep -q "ApplyHTTP2Keepalive" internal/constants/transport.go \
  && grep -q "vertexPostProcessContents" internal/proxy/vertex.go \
  && grep -q "EnsureGeminiTerminalUserTurn" internal/translator/gemini.go \
+ && grep -q "GEMINI_STREAM_DEBUG" internal/handlers/chat/gemini_stream_debug.go \
  && echo "[patch] all fix markers present"
 
 # ── Build the dashboard SPA (bun + Vite) ─────────────────────────────────────
