@@ -12,7 +12,11 @@
 # Gemini-native translator, 0004 ports the Vertex AI forwarding lane (without
 # it every vertex model — gemini-3.1-pro-preview included — gets Google's HTML
 # "404: The requested URL /v1 was not found" because the catalog shipped the
-# provider with no executor and the generic forwarder POSTed the bare /v1).
+# provider with no executor and the generic forwarder POSTed the bare /v1),
+# 0005 stops the per-chunk "empty envelope response" warning spam on native
+# Gemini/Vertex streams, 0006 makes RTK report no-op compressions as no-ops
+# and byte-truncates huge line-poor tool outputs (the saved_est=0 on 90k-token
+# payloads).
 # These are git-format diffs against the pinned upstream SHA, so the router
 # must be compiled here. The v1.9.9 prebuilt release binary on GitHub contains
 # none of them. A prebuilt download was tried on 2026-09-29 (commits 4a44423 /
@@ -50,6 +54,8 @@ RUN apk add --no-cache curl tar patch \
  && grep -q "isVertexProvider" internal/handlers/chat/fallback.go \
  && grep -q "publishers/google/models" internal/proxy/vertex.go \
  && grep -q "postProcessVertexBody" internal/proxy/vertex.go \
+ && ! grep -q "empty envelope response" internal/translator/antigravity.go \
+ && grep -q "truncateBytes" internal/tokensaver/compress.go \
  && echo "[patch] all fix markers present"
 
 # ── Build the dashboard SPA (bun + Vite) ─────────────────────────────────────

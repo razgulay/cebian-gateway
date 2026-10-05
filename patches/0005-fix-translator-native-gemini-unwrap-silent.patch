@@ -1,0 +1,89 @@
+From f9f98bd6c146c847dcafcfa8b10a58b9746851f6 Mon Sep 17 00:00:00 2001
+From: razgulay <bantran09@outlook.com>
+Date: Mon, 5 Oct 2026 13:49:12 +0700
+Subject: [PATCH 5/6] fix(translator): pass native Gemini chunks through the
+ antigravity unwrap silently
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+handleGeminiStream runs UnwrapAntigravityResponse on EVERY SSE chunk, and
+native Gemini / Vertex AI chunks ({"candidates": [...]}) parse fine with
+no "response" wrapper — the empty-envelope branch fired its warning once
+per chunk for the whole stream (antigravity streaming events arrive
+unwrapped too). That path is the common case, not a failure: return raw
+without logging.
+---
+ internal/translator/antigravity.go            |  8 +++-
+ .../translator/antigravity_unwrap_test.go     | 43 +++++++++++++++++++
+ 2 files changed, 49 insertions(+), 2 deletions(-)
+ create mode 100644 internal/translator/antigravity_unwrap_test.go
+
+diff --git a/internal/translator/antigravity.go b/internal/translator/antigravity.go
+index 2d42054..dc3fbbc 100644
+--- a/internal/translator/antigravity.go
++++ b/internal/translator/antigravity.go
+@@ -646,8 +646,12 @@ func UnwrapAntigravityResponse(raw []byte) []byte {
+ 		return raw // passthrough on failure
+ 	}
+ 	if len(envelope.Response) == 0 {
+-		log.Warn("translator", "empty envelope response")
+-		return raw // passthrough on failure
++		// No "response" key is NOT a failure: native Gemini / Vertex AI
++		// payloads ({"candidates": [...], ...}) parse fine and leave the
++		// field nil. handleGeminiStream runs this on EVERY SSE chunk, and
++		// even antigravity streaming events arrive unwrapped, so a warn here
++		// fires once per chunk for the whole stream. Pass through silently.
++		return raw
+ 	}
+ 	return []byte(envelope.Response)
+ }
+diff --git a/internal/translator/antigravity_unwrap_test.go b/internal/translator/antigravity_unwrap_test.go
+new file mode 100644
+index 0000000..d8cd0fa
+--- /dev/null
++++ b/internal/translator/antigravity_unwrap_test.go
+@@ -0,0 +1,43 @@
++package translator
++
++import (
++	"bytes"
++	"testing"
++)
++
++// Regression tests for the UnwrapAntigravityResponse passthrough contract.
++// handleGeminiStream runs UnwrapAntigravityResponse on EVERY SSE chunk, and
++// native Gemini / Vertex AI chunks carry no antigravity "response" wrapper —
++// that path used to log "empty envelope response" once per chunk for the
++// whole stream. The unwrap itself must stay a pure passthrough for payloads
++// without the wrapper.
++
++func TestUnwrapAntigravityResponse_WrappedEnvelope(t *testing.T) {
++	raw := []byte(`{"response":{"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}}`)
++	got := UnwrapAntigravityResponse(raw)
++	want := []byte(`{"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}`)
++	if !bytes.Equal(got, want) {
++		t.Fatalf("wrapped envelope not unwrapped:\n got %s\nwant %s", got, want)
++	}
++}
++
++func TestUnwrapAntigravityResponse_NativeGeminiPassthrough(t *testing.T) {
++	// Native chunk: valid JSON with candidates, no response wrapper. Must be
++	// returned byte-identical (and silently, without the empty-envelope warn).
++	raw := []byte(`{"candidates":[{"content":{"parts":[{"text":"hi"}]}}],"usageMetadata":{"totalTokenCount":90123}}`)
++	if got := UnwrapAntigravityResponse(raw); !bytes.Equal(got, raw) {
++		t.Fatalf("native Gemini payload altered:\n got %s\nwant %s", got, raw)
++	}
++	// promptFeedback-only chunks (blocked prompts) are native too.
++	raw2 := []byte(`{"promptFeedback":{"blockReason":"SAFETY"}}`)
++	if got := UnwrapAntigravityResponse(raw2); !bytes.Equal(got, raw2) {
++		t.Fatalf("native promptFeedback payload altered: %s", got)
++	}
++}
++
++func TestUnwrapAntigravityResponse_InvalidJSONPassthrough(t *testing.T) {
++	raw := []byte(`{not json`)
++	if got := UnwrapAntigravityResponse(raw); !bytes.Equal(got, raw) {
++		t.Fatalf("invalid JSON passthrough altered: %s", got)
++	}
++}

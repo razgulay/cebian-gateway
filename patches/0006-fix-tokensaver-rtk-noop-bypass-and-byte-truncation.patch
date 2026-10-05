@@ -1,0 +1,317 @@
+From 8859b60434e02bd1261aa33bf79be4bff7ee0a81 Mon Sep 17 00:00:00 2001
+From: razgulay <bantran09@outlook.com>
+Date: Mon, 5 Oct 2026 13:49:13 +0700
+Subject: [PATCH 6/6] fix(tokensaver): report RTK no-ops as no-ops,
+ byte-truncate huge line-poor payloads
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two defects behind RTK logs showing saved_est=0 / saved_pct=0% on huge
+tool outputs:
+
+- CompressMessages marked every >MinCompressSize text as compressed even
+  when CompressText returned it unchanged (payload under every line cap),
+  or merely trimmed — logging a zero-saving compression and paying two
+  body re-marshals for it. Compression now counts only on a real size
+  reduction; no-ops return the body byte-identical.
+
+- A 90k-token tool result that fits in few lines (minified JSON, base64,
+  a one-line web fetch) fell through every line-based detector. Line-poor
+  but byte-huge payloads now get byte-mode truncation (head+tail, UTF-8
+  safe) instead of passing through untouched.
+---
+ internal/tokensaver/compress.go              |  72 +++++++++--
+ internal/tokensaver/compress_noop_test.go    | 125 +++++++++++++++++++
+ internal/tokensaver/preserve_numbers_test.go |   6 +-
+ 3 files changed, 192 insertions(+), 11 deletions(-)
+ create mode 100644 internal/tokensaver/compress_noop_test.go
+
+diff --git a/internal/tokensaver/compress.go b/internal/tokensaver/compress.go
+index 45c8b9d..8fcb27a 100644
+--- a/internal/tokensaver/compress.go
++++ b/internal/tokensaver/compress.go
+@@ -17,6 +17,14 @@ const (
+ 	GitLogMaxLines  = 200
+ 	GrepPerFileMax  = 10
+ 	TreeMaxLines    = 200
++
++	// Byte-mode fallback (truncateBytes): payloads that are huge but have too
++	// few lines for line-mode truncation — minified JSON, base64, a web fetch
++	// dumped on one line. A 90k-token tool result that fits in a handful of
++	// lines used to fall through every detector and come back unchanged.
++	ByteTruncMin  = 24 * 1024 // engage only past this size
++	ByteTruncHead = 10 * 1024 // bytes kept from the start
++	ByteTruncTail = 4 * 1024  // bytes kept from the end
+ )
+ 
+ // CompressMessages compresses tool_result content in LLM request bodies in-place.
+@@ -49,12 +57,24 @@ func CompressMessages(body []byte) ([]byte, bool) {
+ 	}
+ 
+ 	compressed := false
++	// shrink wraps CompressText with a real-savings check: the compressor's
++	// detectors (line caps, MinCompressSize) can legitimately return the
++	// input unchanged — a 300-line-but-small tool output, a grep under the
++	// per-file cap. Marking that as "compressed" shipped RTK logs with
++	// saved_est=0 / saved_pct=0% and paid two re-marshals for nothing.
++	shrink := func(text string) string {
++		c := CompressText(text)
++		if len(c) < len(text) {
++			compressed = true
++			return c
++		}
++		return text
++	}
+ 	for _, msg := range items {
+ 		// OpenAI Responses: function_call_output
+ 		if msg["type"] == "function_call_output" {
+ 			if output, ok := msg["output"].(string); ok && len(output) > MinCompressSize {
+-				msg["output"] = CompressText(output)
+-				compressed = true
++				msg["output"] = shrink(output)
+ 			}
+ 			continue
+ 		}
+@@ -62,8 +82,7 @@ func CompressMessages(body []byte) ([]byte, bool) {
+ 		// OpenAI tool message
+ 		if msg["role"] == "tool" {
+ 			if content, ok := msg["content"].(string); ok && len(content) > MinCompressSize {
+-				msg["content"] = CompressText(content)
+-				compressed = true
++				msg["content"] = shrink(content)
+ 			}
+ 			continue
+ 		}
+@@ -80,14 +99,12 @@ func CompressMessages(body []byte) ([]byte, bool) {
+ 			}
+ 			if block["type"] == "tool_result" {
+ 				if text, ok := block["text"].(string); ok && len(text) > MinCompressSize {
+-					block["text"] = CompressText(text)
+-					compressed = true
++					block["text"] = shrink(text)
+ 				}
+ 			}
+ 			if block["type"] == "text" {
+ 				if text, ok := block["text"].(string); ok && len(text) > MinCompressSize {
+-					block["text"] = CompressText(text)
+-					compressed = true
++					block["text"] = shrink(text)
+ 				}
+ 			}
+ 		}
+@@ -111,6 +128,10 @@ func CompressMessages(body []byte) ([]byte, bool) {
+ }
+ 
+ // CompressText applies content-aware compression.
++// Returns the input UNCHANGED when no compressor engages — including the
++// trailing-whitespace case. Callers gate on a real size reduction, so a
++// plain trim must never count as compression (it shipped saved_est=0 logs
++// and a pointless body rewrite for 1 byte of whitespace).
+ func CompressText(text string) string {
+ 	if len(text) < MinCompressSize {
+ 		return text
+@@ -129,7 +150,10 @@ func CompressText(text string) string {
+ 	if isTreeOutput(trimmed) {
+ 		return compressTree(trimmed)
+ 	}
+-	return smartTruncate(trimmed)
++	if t := smartTruncate(trimmed); len(t) < len(trimmed) {
++		return t
++	}
++	return text
+ }
+ 
+ func isGitDiff(s string) bool {
+@@ -209,7 +233,10 @@ func compressTree(s string) string {
+ func smartTruncate(s string) string {
+ 	lines := strings.Split(s, "\n")
+ 	if len(lines) <= SmartTruncMin {
+-		return s
++		// Few lines: line-mode has nothing to cut. A payload can still be
++		// enormous on those few lines, so fall back to byte-mode truncation
++		// instead of returning it unchanged.
++		return truncateBytes(s)
+ 	}
+ 	head := lines[:SmartTruncHead]
+ 	tail := lines[len(lines)-SmartTruncTail:]
+@@ -217,6 +244,31 @@ func smartTruncate(s string) string {
+ 	return strings.Join(append(result, tail...), "\n")
+ }
+ 
++// truncateBytes keeps the head and tail of a byte-heavy, line-poor payload
++// and replaces the middle with a marker. Cuts are backed off to UTF-8 rune
++// boundaries so the kept text stays valid.
++func truncateBytes(s string) string {
++	if len(s) <= ByteTruncMin {
++		return s
++	}
++	headEnd := runeStartIndex(s, ByteTruncHead)
++	tailStart := runeStartIndex(s, len(s)-ByteTruncTail)
++	return s[:headEnd] +
++		"\n... (" + itoa(tailStart-headEnd) + " bytes truncated)\n" +
++		s[tailStart:]
++}
++
++// runeStartIndex returns the largest index <= i that begins a UTF-8 rune.
++func runeStartIndex(s string, i int) int {
++	for i > 0 && i < len(s) && s[i]&0xC0 == 0x80 {
++		i--
++	}
++	if i < 0 {
++		return 0
++	}
++	return i
++}
++
+ func itoa(n int) string {
+ 	return strconv.Itoa(n)
+ }
+diff --git a/internal/tokensaver/compress_noop_test.go b/internal/tokensaver/compress_noop_test.go
+new file mode 100644
+index 0000000..d37e6bc
+--- /dev/null
++++ b/internal/tokensaver/compress_noop_test.go
+@@ -0,0 +1,125 @@
++package tokensaver
++
++import (
++	"encoding/json"
++	"strings"
++	"testing"
++	"unicode/utf8"
++)
++
++// Tests for the RTK no-op bypass and the byte-mode truncation fallback.
++//
++// Before these fixes a 90k-token tool result that fits in few lines (minified
++// JSON, base64, a one-line web fetch) fell through every line-based detector,
++// came back unchanged, and CompressMessages still reported it as compressed:
++// the RTK log shipped saved_est=0 / saved_pct=0% and the body was
++// re-marshaled twice for nothing.
++
++// hugeSingleLine is ~3x ByteTruncMin bytes on ONE line — the shape byte-mode
++// exists for, and the request-body scale of a 90k-token tool result.
++func hugeSingleLine() string {
++	var b strings.Builder
++	b.WriteString(`{"data":"`)
++	for len(b.String()) < ByteTruncMin*3 {
++		b.WriteString(`0123456789abcdef`)
++	}
++	b.WriteString(`"}`)
++	return b.String()
++}
++
++// fewSmallLines is > MinCompressSize but under every truncation threshold:
++// 200 lines x ~50 bytes ≈ 10KB. CompressText must leave it unchanged.
++func fewSmallLines() string {
++	var b strings.Builder
++	for i := 0; i < 200; i++ {
++		b.WriteString("plain log line with some words and a number 12345\n")
++	}
++	return b.String()
++}
++
++func TestCompressText_HugeSingleLine(t *testing.T) {
++	in := hugeSingleLine()
++	out := CompressText(in)
++	if len(out) >= len(in) {
++		t.Fatalf("huge single line not compressed: in=%d out=%d", len(in), len(out))
++	}
++	if !strings.Contains(out, "bytes truncated") {
++		t.Errorf("missing byte-truncation marker in out (%d bytes)", len(out))
++	}
++	// The head and tail must survive so the model keeps context.
++	if !strings.HasPrefix(out, `{"data":"`) {
++		t.Errorf("head lost: %.40s", out)
++	}
++	if !strings.HasSuffix(strings.TrimSpace(out), `"}`) {
++		t.Errorf("tail lost: ...%.40s", out[len(out)-40:])
++	}
++}
++
++func TestCompressText_FewLargeLinesUnchanged(t *testing.T) {
++	in := fewSmallLines()
++	if out := CompressText(in); out != in {
++		t.Fatalf("10KB / 200-line payload should pass through unchanged, got %d bytes", len(out))
++	}
++}
++
++// CompressMessages on a no-op payload must report did=false and return the
++// body byte-identical — not a "compressed" answer with saved_est=0.
++func TestCompressMessages_NoOpNotReported(t *testing.T) {
++	body, err := json.Marshal(map[string]any{
++		"messages": []any{
++			map[string]any{"role": "tool", "content": fewSmallLines()},
++		},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	out, ok := CompressMessages(body)
++	if ok {
++		t.Fatal("no-op compression reported as did=true")
++	}
++	if string(out) != string(body) {
++		t.Error("no-op path rewrote the body")
++	}
++}
++
++// The 90k-token shape: one giant tool result on few lines must compress with
++// real savings, not come back as a 0% no-op.
++func TestCompressMessages_HugeSingleLineCompressed(t *testing.T) {
++	body, err := json.Marshal(map[string]any{
++		"messages": []any{
++			map[string]any{"role": "tool", "content": hugeSingleLine()},
++		},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	out, ok := CompressMessages(body)
++	if !ok {
++		t.Fatal("huge single-line payload not compressed")
++	}
++	orig := len(body) / 4
++	comp := len(out) / 4
++	if comp >= orig {
++		t.Fatalf("no size win: orig_est=%d compressed_est=%d", orig, comp)
++	}
++	// Savings must be substantial, not rounding noise (the bug was 0%).
++	if saved := orig - comp; saved*100/orig < 50 {
++		t.Fatalf("savings too small: %d%% (%d/%d tokens)", saved*100/orig, saved, orig)
++	}
++}
++
++func TestTruncateBytes_RuneSafe(t *testing.T) {
++	// 15000 three-byte runes = 45000 bytes; both cut points (10240, 40904)
++	// land mid-rune and must back off to a rune boundary.
++	s := strings.Repeat("日", 15000)
++	out := truncateBytes(s)
++	if !utf8.ValidString(out) {
++		t.Error("truncateBytes produced invalid UTF-8")
++	}
++	if !strings.Contains(out, "bytes truncated") {
++		t.Errorf("missing marker: %d bytes", len(out))
++	}
++	if !strings.HasPrefix(out, "日") || !strings.HasSuffix(out, "日") {
++		t.Error("head/tail runes damaged")
++	}
++}
+diff --git a/internal/tokensaver/preserve_numbers_test.go b/internal/tokensaver/preserve_numbers_test.go
+index dc8f595..29f1166 100644
+--- a/internal/tokensaver/preserve_numbers_test.go
++++ b/internal/tokensaver/preserve_numbers_test.go
+@@ -11,7 +11,11 @@ import (
+ // coerces numbers to float64 and changes their representation. UseNumber()
+ // preserves the original literal.
+ func TestCompressMessages_PreservesNumericFields(t *testing.T) {
+-	bigContent := strings.Repeat("x", MinCompressSize+10)
++	// `\n` as raw-string escape: the JSON string parses to 300 real lines so
++	// line-mode truncation fires (a single-line blob under ByteTruncMin is a
++	// legitimate no-op now and would not drive the re-marshal this test
++	// exercises).
++	bigContent := strings.Repeat(`numeric preservation line 0123456789\n`, 300)
+ 	body := []byte(`{
+ 		"model": "gpt-4o",
+ 		"temperature": 0.7,
