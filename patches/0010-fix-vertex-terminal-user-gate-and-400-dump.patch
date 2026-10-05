@@ -1,0 +1,250 @@
+From ecb3b9f7ec56aa64fd69abf279ec3eba0f7fb3b8 Mon Sep 17 00:00:00 2001
+From: razgulay <bantran09@outlook.com>
+Date: Mon, 5 Oct 2026 21:21:24 +0700
+Subject: [PATCH 10/10] fix(vertex): terminal-user gate on the final wire body
+ + 400 payload dump
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+After the role fix, Vertex moved to the next rejection: 'Requests ending
+with a model turn are not supported.' The translator's terminal-turn
+guard provably fires for every shape probed (assistant-last, tool flows,
+multi-round), so the shape must resurface between the translator and the
+socket. ForwardVertex now re-establishes the guarantee on the final wire
+body — EnsureGeminiTerminalUserTurn appends the guard turn (a
+functionResponse per unanswered call, else a Continue. nudge) when the
+contents end with model, map-based so unknown top-level fields survive.
+It runs BEFORE the vertex post-process so the synthesized guard ids get
+the vertex id strip.
+
+Every vertex 400 also dumps its exact request body to
+/tmp/9router-vertex-400.json (same post-mortem pattern as
+ForwardGemini), so the next schema rejection is diagnosable against the
+payload that drew it instead of guesswork.
+---
+ internal/proxy/vertex.go                      |  12 ++
+ internal/translator/gemini.go                 |  56 +++++++++
+ .../translator/gemini_terminal_gate_test.go   | 109 ++++++++++++++++++
+ 3 files changed, 177 insertions(+)
+ create mode 100644 internal/translator/gemini_terminal_gate_test.go
+
+diff --git a/internal/proxy/vertex.go b/internal/proxy/vertex.go
+index 73b5308..c5fd6e7 100644
+--- a/internal/proxy/vertex.go
++++ b/internal/proxy/vertex.go
+@@ -13,6 +13,7 @@ import (
+ 	"io"
+ 	"net/http"
+ 	"net/url"
++	"os"
+ 	"regexp"
+ 	"strings"
+ 	"sync"
+@@ -575,6 +576,10 @@ func ForwardVertex(ctx context.Context, client *http.Client, cfg *providers.Prov
+ 	if err != nil {
+ 		return nil, fmt.Errorf("translate to Gemini: %w", err)
+ 	}
++	// Terminal-user gate BEFORE the vertex post-process, so a guard turn this
++	// synthesizes (functionResponse ids included) still gets the vertex id
++	// strip below.
++	geminiBody = translator.EnsureGeminiTerminalUserTurn(geminiBody)
+ 	sendBody := postProcessVertexBody(geminiBody)
+ 
+ 	requestURL := vertexGeminiURL(vertexBaseHost(cfg.BaseURL), modelName, isStream, auth)
+@@ -599,6 +604,13 @@ func ForwardVertex(ctx context.Context, client *http.Client, cfg *providers.Prov
+ 		if readErr != nil {
+ 			return nil, fmt.Errorf("upstream returned %d and body read failed: %w", resp.StatusCode, readErr)
+ 		}
++		// Dump every 400 payload for post-mortem — a schema rejection is only
++		// diagnosable against the exact body that drew it (same pattern as
++		// ForwardGemini's 400 dump).
++		if resp.StatusCode == http.StatusBadRequest {
++			_ = os.WriteFile("/tmp/9router-vertex-400.json", sendBody, 0644)
++			log.Warn("vertex", "dumped 400 request to /tmp/9router-vertex-400.json", "model", modelName, "bytes", len(sendBody))
++		}
+ 		log.Warn("vertex", "upstream error", "model", modelName, "status", resp.StatusCode, "body", truncateErrBody(errBody))
+ 		return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: errBody, Header: resp.Header}
+ 	}
+diff --git a/internal/translator/gemini.go b/internal/translator/gemini.go
+index 659dac2..157bfdb 100644
+--- a/internal/translator/gemini.go
++++ b/internal/translator/gemini.go
+@@ -1085,6 +1085,62 @@ func geminiCanonicalRole(role string, parts []GeminiPart) string {
+ 	}
+ }
+ 
++// EnsureGeminiTerminalUserTurn re-establishes, on a fully-built Gemini
++// request body, the guarantee NormalizeGeminiContents enforces after
++// translation: the Gemini and Vertex generateContent endpoints reject a
++// contents array that ends with a model turn ("Requests ending with a model
++// turn are not supported."). Call it on the FINAL wire body — any producer
++// between the translator and the socket (post-processors, request
++// rewriters, client-supplied Gemini bodies) can otherwise resurface the
++// shape. Map-based on purpose: a struct round-trip would drop unknown
++// top-level fields (the vertex post-process role-drop lesson).
++func EnsureGeminiTerminalUserTurn(body []byte) []byte {
++	var doc map[string]jsontext.Value
++	if err := json.Unmarshal(body, &doc); err != nil {
++		return body
++	}
++	raw, ok := doc["contents"]
++	if !ok || !raw.IsValid() {
++		return body
++	}
++	var turns []struct {
++		Role  string         `json:"role"`
++		Parts jsontext.Value `json:"parts"`
++	}
++	if err := json.Unmarshal(raw, &turns); err != nil {
++		return body
++	}
++	if len(turns) == 0 || turns[len(turns)-1].Role != "model" {
++		return body
++	}
++	var lastParts []GeminiPart
++	if err := json.Unmarshal(turns[len(turns)-1].Parts, &lastParts); err != nil {
++		return body
++	}
++	guard, err := json.Marshal(GeminiContent{Role: "user", Parts: geminiTerminalUserParts(lastParts)})
++	if err != nil {
++		return body
++	}
++	var guardTurn struct {
++		Role  string         `json:"role"`
++		Parts jsontext.Value `json:"parts"`
++	}
++	if err := json.Unmarshal(guard, &guardTurn); err != nil {
++		return body
++	}
++	turns = append(turns, guardTurn)
++	out, err := json.Marshal(turns)
++	if err != nil {
++		return body
++	}
++	doc["contents"] = jsontext.Value(out)
++	whole, err := json.Marshal(doc)
++	if err != nil {
++		return body
++	}
++	return whole
++}
++
+ func NormalizeGeminiContents(contents []GeminiContent) []GeminiContent {
+ 	out := make([]GeminiContent, 0, len(contents)+2)
+ 	for _, c := range contents {
+diff --git a/internal/translator/gemini_terminal_gate_test.go b/internal/translator/gemini_terminal_gate_test.go
+new file mode 100644
+index 0000000..a3299e2
+--- /dev/null
++++ b/internal/translator/gemini_terminal_gate_test.go
+@@ -0,0 +1,109 @@
++package translator
++
++import (
++	"strings"
++	"testing"
++
++	json "encoding/json/v2"
++	"encoding/json/jsontext"
++)
++
++// The final-gate guarantee: a Gemini request body that ends with a model
++// turn is rejected by the Gemini and Vertex generateContent endpoints
++// ("Requests ending with a model turn are not supported."). The translator
++// normalizes this already; EnsureGeminiTerminalUserTurn re-establishes it on
++// the wire body so nothing between translator and socket can resurface the
++// shape.
++
++func TestEnsureGeminiTerminalUserTurn_AppendsGuardTurn(t *testing.T) {
++	body := []byte(`{"contents":[
++		{"role":"user","parts":[{"text":"go"}]},
++		{"role":"model","parts":[{"functionCall":{"name":"f","id":"call_1","args":{}}}]}
++	]}`)
++	out := EnsureGeminiTerminalUserTurn(body)
++
++	var req struct {
++		Contents []struct {
++			Role  string           `json:"role"`
++			Parts []map[string]any `json:"parts"`
++		} `json:"contents"`
++	}
++	if err := json.Unmarshal(out, &req); err != nil {
++		t.Fatal(err)
++	}
++	if len(req.Contents) != 3 {
++		t.Fatalf("expected 3 contents, got %d: %s", len(req.Contents), out)
++	}
++	last := req.Contents[len(req.Contents)-1]
++	if last.Role != "user" {
++		t.Fatalf("guard turn role %q, want user", last.Role)
++	}
++	if len(last.Parts) != 1 {
++		t.Fatalf("guard parts: %v", last.Parts)
++	}
++	if fr, ok := last.Parts[0]["functionResponse"].(map[string]any); ok {
++		if fr["name"] != "f" {
++			t.Errorf("guard functionResponse name = %v", fr["name"])
++		}
++		if fr["id"] != "call_1" {
++			t.Errorf("guard functionResponse id = %v, want call_1", fr["id"])
++		}
++	} else {
++		t.Errorf("guard part is not a functionResponse: %v", last.Parts[0])
++	}
++}
++
++func TestEnsureGeminiTerminalUserTurn_TextModelTurnGetsNudge(t *testing.T) {
++	body := []byte(`{"contents":[
++		{"role":"user","parts":[{"text":"q"}]},
++		{"role":"model","parts":[{"text":"partial answer"}]}
++	]}`)
++	out := EnsureGeminiTerminalUserTurn(body)
++	if !strings.Contains(string(out), `"role":"user"`) {
++		t.Fatalf("no guard turn: %s", out)
++	}
++	var req struct {
++		Contents []struct {
++			Role  string `json:"role"`
++			Parts []struct {
++				Text string `json:"text"`
++			} `json:"parts"`
++		} `json:"contents"`
++	}
++	if err := json.Unmarshal(out, &req); err != nil {
++		t.Fatal(err)
++	}
++	last := req.Contents[len(req.Contents)-1]
++	if last.Role != "user" || len(last.Parts) == 0 || last.Parts[0].Text == "" {
++		t.Fatalf("guard nudge missing: %+v", last)
++	}
++}
++
++// A body already ending with user must pass through byte-identical.
++func TestEnsureGeminiTerminalUserTurn_UserLastUntouched(t *testing.T) {
++	body := []byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`)
++	if out := EnsureGeminiTerminalUserTurn(body); string(out) != string(body) {
++		t.Fatalf("user-last body rewritten: %s", out)
++	}
++}
++
++// Unknown top-level fields must survive (the struct round-trip lesson).
++func TestEnsureGeminiTerminalUserTurn_PreservesOtherKeys(t *testing.T) {
++	body := []byte(`{"systemInstruction":{"parts":[{"text":"sys"}]},
++		"tools":[{"functionDeclarations":[{"name":"f"}]}],
++		"contents":[
++			{"role":"user","parts":[{"text":"q"}]},
++			{"role":"model","parts":[{"text":"a"}]}
++		]}`)
++	out := EnsureGeminiTerminalUserTurn(body)
++	var doc map[string]jsontext.Value
++	if err := json.Unmarshal(out, &doc); err != nil {
++		t.Fatal(err)
++	}
++	if _, ok := doc["systemInstruction"]; !ok {
++		t.Error("systemInstruction dropped")
++	}
++	if _, ok := doc["tools"]; !ok {
++		t.Error("tools dropped")
++	}
++}
