@@ -16,7 +16,9 @@
 # 0005 stops the per-chunk "empty envelope response" warning spam on native
 # Gemini/Vertex streams, 0006 makes RTK report no-op compressions as no-ops
 # and byte-truncates huge line-poor tool outputs (the saved_est=0 on 90k-token
-# payloads).
+# payloads), 0007 validates thought signatures before sending so a corrupted
+# or stale one is replaced with the known-accepted default upfront instead of
+# paying Google's 400 + reactive re-send.
 # These are git-format diffs against the pinned upstream SHA, so the router
 # must be compiled here. The v1.9.9 prebuilt release binary on GitHub contains
 # none of them. A prebuilt download was tried on 2026-09-29 (commits 4a44423 /
@@ -56,6 +58,7 @@ RUN apk add --no-cache curl tar patch \
  && grep -q "postProcessVertexBody" internal/proxy/vertex.go \
  && ! grep -q "empty envelope response" internal/translator/antigravity.go \
  && grep -q "truncateBytes" internal/tokensaver/compress.go \
+ && grep -q "validThoughtSignature" internal/translator/gemini.go \
  && echo "[patch] all fix markers present"
 
 # ── Build the dashboard SPA (bun + Vite) ─────────────────────────────────────

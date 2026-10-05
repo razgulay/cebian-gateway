@@ -1,0 +1,347 @@
+From 6f16dc6afa161b7d80cd1899d5267784c3552445 Mon Sep 17 00:00:00 2001
+From: razgulay <bantran09@outlook.com>
+Date: Mon, 5 Oct 2026 14:18:18 +0700
+Subject: [PATCH 7/7] fix(translator): validate thought signatures upfront
+ instead of eating a 400 retry
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Multi-turn tool conversations carried stale or client-mangled
+thoughtSignature values upstream — __ts__ payloads the client truncated,
+space-mangled, or percent-encoded on the way back, plus expired store
+entries that outlived a Google key rotation. Google answered 400
+"Corrupted thought signature. INVALID_ARGUMENT" and only then did
+proxy.ForwardGemini replace every signature with DefaultThinkingSignature
+and replay, doubling latency on every corrupted turn.
+
+TranslateOpenAIToGemini now shape-validates every signature before the
+request leaves (base64-decodable, sane length) and signs unusable ones
+with the known-accepted default immediately. Unsigned sibling calls are
+defaulted too — first-call-only defaulting left them unsigned, and the
+reactive retry's all-default replay is the proven-accepted shape. The
+reactive retry stays as a last-resort safety net.
+---
+ internal/translator/gemini.go                 |  53 +++++++-
+ internal/translator/gemini_test.go            |  16 +--
+ internal/translator/gemini_thoughtsig_test.go | 119 ++++++++++++++++++
+ .../thought_signature_store_test.go           |  15 ++-
+ 4 files changed, 188 insertions(+), 15 deletions(-)
+ create mode 100644 internal/translator/gemini_thoughtsig_test.go
+
+diff --git a/internal/translator/gemini.go b/internal/translator/gemini.go
+index 36c8225..af2e7fb 100644
+--- a/internal/translator/gemini.go
++++ b/internal/translator/gemini.go
+@@ -2,6 +2,7 @@ package translator
+ 
+ import (
+ 	"bytes"
++	"encoding/base64"
+ 	"encoding/json/jsontext"
+ 	json "encoding/json/v2"
+ 	"fmt"
+@@ -252,20 +253,36 @@ func TranslateOpenAIToGemini(openaiBody []byte) ([]byte, error) {
+ 			}
+ 
+ 			// Tool calls → functionCall parts
+-			firstFunctionCallSeen := false
+ 			for _, tc := range msg.ToolCalls {
+ 				var args map[string]any
+ 				if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+ 					args = make(map[string]any)
+ 				}
+ 				ts := extractThoughtSig(tc.ID)
++				if !validThoughtSignature(ts) {
++					ts = ""
++				}
+ 				if ts == "" {
++					// Store lookup second: entries come from Google responses
++					// so they are usually well-formed, but a store hit can
++					// still be stale (TTL-expired entries are filtered, key
++					// rotation is not detectable client-side). Shape-validate
++					// anyway — a corrupted value here 400s the whole request.
+ 					ts = GetGeminiThoughtSignature(tc.ID, "", oreq.Model)
++					if !validThoughtSignature(ts) {
++						ts = ""
++					}
+ 				}
+-				if ts == "" && !firstFunctionCallSeen {
++				if ts == "" {
++					// No usable signature: sign with the known-valid default
++					// instead of sending an unsigned or corrupted part.
++					// Google rejects a corrupted signature outright
++					// ("Corrupted thought signature. INVALID_ARGUMENT"), and
++					// the reactive 400-retry in proxy.ForwardGemini proves a
++					// default-signed history is accepted — signing here just
++					// skips the wasted round-trip.
+ 					ts = DefaultThinkingSignature
+ 				}
+-				firstFunctionCallSeen = true
+ 				gp := GeminiPart{FunctionCall: &GeminiFunctionCall{Name: tc.Function.Name, ID: stripThoughtSig(tc.ID), Args: args}, ThoughtSignature: ts}
+ 				parts = append(parts, gp)
+ 			}
+@@ -416,6 +433,36 @@ func extractThoughtSig(id string) string {
+ 	return ""
+ }
+ 
++// Bounds for a plausible Google thought signature. Real ones are base64
++// blobs of at least a few hundred bytes; the shipped defaults are 1-4KB.
++// Anything below the floor or above the cap is client-mangled garbage, not
++// a signature Google will accept.
++const (
++	thoughtSigMinEncodedLen = 64
++	thoughtSigMaxEncodedLen = 64 * 1024
++)
++
++// validThoughtSignature reports whether sig has the shape of a real Google
++// thought signature: long enough, short enough, and decodable as standard
++// base64 (padded or raw). Clients round-trip these inside tool_call IDs and
++// are free to mangle them — truncation, "+"→" " rewriting, percent-encoding
++// — and an invalid one reaches Google as "Corrupted thought signature.
++// INVALID_ARGUMENT", 400ing the request. Callers fall back to
++// DefaultThinkingSignature when this returns false.
++func validThoughtSignature(sig string) bool {
++	if len(sig) < thoughtSigMinEncodedLen || len(sig) > thoughtSigMaxEncodedLen {
++		return false
++	}
++	decoded, err := base64.StdEncoding.DecodeString(sig)
++	if err != nil {
++		decoded, err = base64.RawStdEncoding.DecodeString(sig)
++		if err != nil {
++			return false
++		}
++	}
++	return len(decoded) > 0
++}
++
+ // stripThoughtSig removes the "__ts__<sig>" suffix the response translator
+ // encodes into a tool call ID (see TranslateGeminiResponseToOpenAI). Gemini
+ // matches a functionResponse to its functionCall by id, so both sides must
+diff --git a/internal/translator/gemini_test.go b/internal/translator/gemini_test.go
+index aa7fd5b..4dc03af 100644
+--- a/internal/translator/gemini_test.go
++++ b/internal/translator/gemini_test.go
+@@ -20,7 +20,7 @@ func TestThoughtSignatureResponseRoundTrip(t *testing.T) {
+ 						"name": "get_weather",
+ 						"args": {"location": "Jakarta"}
+ 					},
+-					"thought_signature": "EvEFCu4FAQw..."
++					"thought_signature": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+ 				}]
+ 			},
+ 			"finishReason": "STOP"
+@@ -74,7 +74,7 @@ func TestThoughtSignatureResponseRoundTrip(t *testing.T) {
+ 	if !strings.Contains(tc.ID, "__ts__") {
+ 		t.Errorf("tool call ID missing __ts__ encoding: %s", tc.ID)
+ 	}
+-	if !strings.HasSuffix(tc.ID, "__ts__EvEFCu4FAQw...") {
++	if !strings.HasSuffix(tc.ID, "__ts__AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA") {
+ 		t.Errorf("expected thought_sig suffix in tool call ID, got %s", tc.ID)
+ 	}
+ 	if tc.Type != "function" {
+@@ -92,7 +92,7 @@ func TestThoughtSignatureResponseRoundTrip(t *testing.T) {
+ 				"content": "Let me check the weather.",
+ 				"tool_calls": [
+ 					{
+-						"id": "call_get_weather_0__ts__EvEFCu4FAQw...",
++						"id": "call_get_weather_0__ts__AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+ 						"type": "function",
+ 						"function": {
+ 							"name": "get_weather",
+@@ -130,7 +130,7 @@ func TestThoughtSignatureResponseRoundTrip(t *testing.T) {
+ 	// The native Gemini generateContent endpoint only recognizes the camelCase
+ 	// part field. The 400 "missing thought_signature" regression was caused by
+ 	// emitting snake_case here.
+-	if !strings.Contains(string(geminiBytes), `"thoughtSignature":"EvEFCu4FAQw..."`) {
++	if !strings.Contains(string(geminiBytes), `"thoughtSignature":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"`) {
+ 		t.Errorf("emitted Gemini part must use camelCase thoughtSignature, got: %s", geminiBytes)
+ 	}
+ 	if strings.Contains(string(geminiBytes), `"thought_signature"`) {
+@@ -172,7 +172,7 @@ func TestThoughtSignatureResponseRoundTrip(t *testing.T) {
+ 	for _, p := range parts {
+ 		if p.FunctionCall != nil && p.FunctionCall.Name == "get_weather" {
+ 			found = true
+-			if p.ThoughtSignature != "EvEFCu4FAQw..." {
++			if p.ThoughtSignature != "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" {
+ 				t.Errorf("thought_signature not decoded properly, got: %q", p.ThoughtSignature)
+ 			}
+ 			if p.FunctionCall.Args["location"] != "Jakarta" {
+@@ -302,7 +302,7 @@ func TestGeminiThoughtSignature(t *testing.T) {
+ 				"content": "",
+ 				"tool_calls": [
+ 					{
+-						"id": "call_1__ts__test_signature",
++						"id": "call_1__ts__AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+ 						"type": "function",
+ 						"function": {
+ 							"name": "get_weather",
+@@ -339,8 +339,8 @@ func TestGeminiThoughtSignature(t *testing.T) {
+ 		for _, p := range c.Parts {
+ 			if p.FunctionCall != nil && p.FunctionCall.Name == "get_weather" {
+ 				found = true
+-				if p.ThoughtSignature != "test_signature" {
+-					t.Errorf("expected thought_signature to be 'test_signature', got: %q", p.ThoughtSignature)
++				if p.ThoughtSignature != "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" {
++					t.Errorf("expected thought_signature to be 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', got: %q", p.ThoughtSignature)
+ 				}
+ 			}
+ 		}
+diff --git a/internal/translator/gemini_thoughtsig_test.go b/internal/translator/gemini_thoughtsig_test.go
+new file mode 100644
+index 0000000..c441e85
+--- /dev/null
++++ b/internal/translator/gemini_thoughtsig_test.go
+@@ -0,0 +1,119 @@
++package translator
++
++import (
++	"encoding/base64"
++	"strings"
++	"testing"
++
++	json "encoding/json/v2"
++)
++
++// Regression tests for the proactive thought-signature sanitizer: a tool_call
++// whose id carries a corrupted (client-mangled) __ts__ payload used to go
++// upstream as-is, and Google answered 400 "Corrupted thought signature.
++// INVALID_ARGUMENT". The reactive 400-retry in proxy.ForwardGemini then
++// replaced every signature with the default and replayed — doubling latency
++// on every corrupted turn. The translator now shape-validates signatures and
++// signs unusable ones with the default BEFORE the request leaves.
++
++func geminiCallSignatures(t *testing.T, openaiBody string) []string {
++	t.Helper()
++	out, err := TranslateOpenAIToGemini([]byte(openaiBody))
++	if err != nil {
++		t.Fatalf("TranslateOpenAIToGemini: %v", err)
++	}
++	var req GeminiRequest
++	if err := json.Unmarshal(out, &req); err != nil {
++		t.Fatalf("unmarshal gemini request: %v", err)
++	}
++	var sigs []string
++	for _, c := range req.Contents {
++		for _, p := range c.Parts {
++			if p.FunctionCall != nil {
++				sigs = append(sigs, p.ThoughtSignature)
++			}
++		}
++	}
++	return sigs
++}
++
++func toolCallBody(ids ...string) string {
++	var b strings.Builder
++	b.WriteString(`{"model":"gemini-3-pro-preview","messages":[{"role":"user","content":"go"},{"role":"assistant","content":null,"tool_calls":[`)
++	for i, id := range ids {
++		if i > 0 {
++			b.WriteString(",")
++		}
++		b.WriteString(`{"id":"` + id + `","type":"function","function":{"name":"fs_read","arguments":"{}"}}`)
++	}
++	b.WriteString(`]},{"role":"tool","tool_call_id":"` + ids[0] + `","content":"[]"}]}`)
++	return b.String()
++}
++
++func TestValidThoughtSignature(t *testing.T) {
++	valid := base64.StdEncoding.EncodeToString(make([]byte, 200))
++	validRaw := base64.RawStdEncoding.EncodeToString(make([]byte, 200))
++	cases := []struct {
++		name string
++		sig  string
++		want bool
++	}{
++		{"valid padded", valid, true},
++		{"valid raw", validRaw, true},
++		{"empty", "", false},
++		{"too short", base64.StdEncoding.EncodeToString([]byte("abc")), false},
++		{"not base64", "not!!base64###", false},
++		{"client space-mangled", strings.ReplaceAll(valid[:80], "A", " ") + valid[80:], false},
++	}
++	for _, tc := range cases {
++		if got := validThoughtSignature(tc.sig); got != tc.want {
++			t.Errorf("%s: validThoughtSignature = %v, want %v", tc.name, got, tc.want)
++		}
++	}
++}
++
++func TestTranslateOpenAIToGemini_ReplacesCorruptedTransportedSignature(t *testing.T) {
++	sigs := geminiCallSignatures(t, toolCallBody("call_abc__ts__not!!base64###"))
++	if len(sigs) != 1 {
++		t.Fatalf("expected 1 functionCall, got %d", len(sigs))
++	}
++	if sigs[0] != DefaultThinkingSignature {
++		t.Fatalf("corrupted signature forwarded upstream: %.40s", sigs[0])
++	}
++}
++
++func TestTranslateOpenAIToGemini_KeepsValidTransportedSignature(t *testing.T) {
++	sig := base64.StdEncoding.EncodeToString(make([]byte, 300))
++	sigs := geminiCallSignatures(t, toolCallBody("call_abc__ts__"+sig))
++	if len(sigs) != 1 {
++		t.Fatalf("expected 1 functionCall, got %d", len(sigs))
++	}
++	if sigs[0] != sig {
++		t.Fatal("valid transported signature was not preserved")
++	}
++}
++
++// The old code defaulted only the FIRST tool call of a message and left the
++// rest unsigned; every call now carries either a validated signature or the
++// known-accepted default (the shape the reactive 400-retry produces).
++func TestTranslateOpenAIToGemini_DefaultsEveryUnsignedToolCall(t *testing.T) {
++	sigs := geminiCallSignatures(t, toolCallBody("call_a", "call_b", "call_c"))
++	if len(sigs) != 3 {
++		t.Fatalf("expected 3 functionCalls, got %d", len(sigs))
++	}
++	for i, sig := range sigs {
++		if sig != DefaultThinkingSignature {
++			t.Errorf("call %d not default-signed: %.40s", i, sig)
++		}
++	}
++}
++
++// Truncated __ts__ payloads (clients that cap id length) must not reach
++// Google either.
++func TestTranslateOpenAIToGemini_ReplacesTruncatedTransportedSignature(t *testing.T) {
++	sig := base64.StdEncoding.EncodeToString(make([]byte, 300))
++	sigs := geminiCallSignatures(t, toolCallBody("call_abc__ts__"+sig[:40]))
++	if len(sigs) != 1 || sigs[0] != DefaultThinkingSignature {
++		t.Fatalf("truncated signature not replaced: %.40s", sigs[0])
++	}
++}
+diff --git a/internal/translator/thought_signature_store_test.go b/internal/translator/thought_signature_store_test.go
+index 4bfe2d8..6f5a50e 100644
+--- a/internal/translator/thought_signature_store_test.go
++++ b/internal/translator/thought_signature_store_test.go
+@@ -35,7 +35,12 @@ func TestThoughtSignatureStore_BasicAndSession(t *testing.T) {
+ 	}
+ }
+ 
+-func TestThoughtSignatureStore_ParallelCallsFirstGetsSig(t *testing.T) {
++// TestThoughtSignatureStore_ParallelCallsAllSigned: with no cached or
++// transported signature, EVERY sibling call in a parallel tool-call turn is
++// signed with DefaultThinkingSignature — the shape the reactive 400-retry
++// produces and Google accepts. The old first-call-only defaulting left the
++// siblings unsigned.
++func TestThoughtSignatureStore_ParallelCallsAllSigned(t *testing.T) {
+ 	ClearGeminiThoughtSignatures()
+ 
+ 	reqJSON := []byte(`{
+@@ -94,9 +99,11 @@ func TestThoughtSignatureStore_ParallelCallsFirstGetsSig(t *testing.T) {
+ 		t.Errorf("first call should have default signature, got %q", parts[0].ThoughtSignature)
+ 	}
+ 
+-	// Second sibling call without cached sig should be unsigned (empty)
+-	if parts[1].ThoughtSignature != "" {
+-		t.Errorf("second sibling call should be unsigned, got %q", parts[1].ThoughtSignature)
++	// Second sibling call without cached sig gets the default too — an
++	// unsigned part risks the 400 family, and default-signed history is the
++	// proven-accepted shape.
++	if parts[1].ThoughtSignature != DefaultThinkingSignature {
++		t.Errorf("second sibling call should have default signature, got %q", parts[1].ThoughtSignature)
+ 	}
+ }
+ 
