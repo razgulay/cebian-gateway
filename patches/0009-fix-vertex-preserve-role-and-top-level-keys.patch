@@ -1,0 +1,218 @@
+From 3764d39d499230cc2db65d4cb41f20bd2643dfc2 Mon Sep 17 00:00:00 2001
+From: razgulay <bantran09@outlook.com>
+Date: Mon, 5 Oct 2026 20:48:29 +0700
+Subject: [PATCH 9/9] fix(vertex): preserve role and every top-level key in the
+ vertex body post-process
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+postProcessVertexBody parsed the Gemini body into a struct carrying only
+contents[].parts and re-marshaled THAT as the whole request. Every content
+lost its role — Google's 400 'Please use a valid role: user, model.' —
+and every other top-level key (systemInstruction, tools, toolConfig,
+generationConfig) was silently dropped from the request: no tools, no
+system prompt, no temperature on the whole vertex lane.
+
+The post-process is now a surgical edit: the document stays a top-level
+map of raw JSON, only contents[].parts maps are rewritten, and the role
+travels with each turn (vertexPostProcessContents). Strengthened the test
+to pin role preservation, top-level key preservation, and idempotency.
+---
+ internal/proxy/vertex.go      | 40 +++++++++++++----
+ internal/proxy/vertex_test.go | 81 ++++++++++++++++++++++++++---------
+ 2 files changed, 93 insertions(+), 28 deletions(-)
+
+diff --git a/internal/proxy/vertex.go b/internal/proxy/vertex.go
+index b5497a4..73b5308 100644
+--- a/internal/proxy/vertex.go
++++ b/internal/proxy/vertex.go
+@@ -19,6 +19,7 @@ import (
+ 	"time"
+ 
+ 	json "encoding/json/v2"
++	"encoding/json/jsontext"
+ 
+ 	"9router/proxy/internal/constants"
+ 	"9router/proxy/internal/log"
+@@ -456,17 +457,28 @@ func VertexPartnerChatURL(host string, auth *vertexAuth) (string, error) {
+ // postProcessVertexBody adapts a Gemini-format body to Vertex: replace every
+ // thoughtSignature with the Vertex-native one and strip the id from
+ // functionCall/functionResponse parts (Vertex rejects ids).
++//
++// The edit is surgical — the document is parsed as a top-level map of raw
++// JSON and only contents[].parts maps are rewritten. An earlier version
++// parsed into a struct that only carried contents[].parts and re-marshaled
++// THAT, silently dropping the role on every content (Google's 400 "Please
++// use a valid role: user, model.") plus systemInstruction, tools,
++// toolConfig and generationConfig from the whole request.
+ func postProcessVertexBody(body []byte) []byte {
+-	var parsed struct {
+-		Contents []struct {
+-			Parts []map[string]any `json:"parts"`
+-		} `json:"contents"`
++	var doc map[string]jsontext.Value
++	if err := json.Unmarshal(body, &doc); err != nil {
++		return body
+ 	}
+-	if err := json.Unmarshal(body, &parsed); err != nil {
++	rawContents, ok := doc["contents"]
++	if !ok || !jsontext.Value(rawContents).IsValid() {
++		return body
++	}
++	var contents []vertexPostProcessContents
++	if err := json.Unmarshal(rawContents, &contents); err != nil {
+ 		return body
+ 	}
+ 	changed := false
+-	for _, turn := range parsed.Contents {
++	for _, turn := range contents {
+ 		for _, part := range turn.Parts {
+ 			// Only rewrite on a real difference: a body that is already
+ 			// Vertex-processed (default signature, ids gone) must pass through
+@@ -492,11 +504,23 @@ func postProcessVertexBody(body []byte) []byte {
+ 	if !changed {
+ 		return body
+ 	}
+-	out, err := json.Marshal(parsed)
++	out, err := json.Marshal(contents)
+ 	if err != nil {
+ 		return body
+ 	}
+-	return out
++	doc["contents"] = jsontext.Value(out)
++	whole, err := json.Marshal(doc)
++	if err != nil {
++		return body
++	}
++	return whole
++}
++
++// vertexPostProcessContents keeps the role on every content turn — role is
++// mandatory on Vertex ("Please use a valid role: user, model.").
++type vertexPostProcessContents struct {
++	Role  string           `json:"role,omitempty"`
++	Parts []map[string]any `json:"parts"`
+ }
+ 
+ // ── Entry points ────────────────────────────────────────────────────────────
+diff --git a/internal/proxy/vertex_test.go b/internal/proxy/vertex_test.go
+index 3f735b0..82c88a6 100644
+--- a/internal/proxy/vertex_test.go
++++ b/internal/proxy/vertex_test.go
+@@ -120,40 +120,78 @@ func TestVertexPartnerChatURL(t *testing.T) {
+ 
+ // postProcessVertexBody must mirror openai-to-vertex.js: replace every
+ // thoughtSignature with the Vertex default and strip functionCall /
+-// functionResponse ids.
++// functionResponse ids — WITHOUT touching anything else in the document.
++// The first version parsed only contents[].parts and re-marshaled the whole
++// body, dropping the role on every content (400 "Please use a valid role:
++// user, model.") and every other top-level key (systemInstruction, tools,
++// generationConfig).
+ func TestPostProcessVertexBodyStripsIDsAndReplacesSignature(t *testing.T) {
+-	in := []byte(`{"contents":[
+-		{"role":"model","parts":[{"functionCall":{"name":"fs_read","id":"call_1","args":{"p":1}},"thoughtSignature":"AGSIG"}]},
+-		{"role":"user","parts":[{"functionResponse":{"name":"fs_read","id":"call_1","response":{"result":"ok"}}}]}
+-	]}`)
++	in := []byte(`{
++		"systemInstruction":{"parts":[{"text":"sys"}]},
++		"generationConfig":{"temperature":0.7,"maxOutputTokens":1024},
++		"tools":[{"functionDeclarations":[{"name":"fs_read"}]}],
++		"contents":[
++			{"role":"model","parts":[{"functionCall":{"name":"fs_read","id":"call_1","args":{"p":1}},"thoughtSignature":"AGSIG"}]},
++			{"role":"user","parts":[{"functionResponse":{"name":"fs_read","id":"call_1","response":{"result":"ok"}}}]},
++			{"role":"user","parts":[{"text":"hi"}]}
++		]
++	}`)
+ 	out := postProcessVertexBody(in)
+ 
+ 	var body struct {
+-		Contents []struct {
+-			Parts []jsontext.Value `json:"parts"`
+-		} `json:"contents"`
++		SystemInstruction jsontext.Value  `json:"systemInstruction"`
++		GenerationConfig  jsontext.Value  `json:"generationConfig"`
++		Tools             jsontext.Value  `json:"tools"`
++		Contents          []jsontext.Value `json:"contents"`
+ 	}
+ 	if err := json.Unmarshal(out, &body); err != nil {
+ 		t.Fatalf("reparse: %v", err)
+ 	}
+-	if len(body.Contents) != 2 {
++	if len(body.Contents) != 3 {
+ 		t.Fatalf("contents lost: %s", out)
+ 	}
+-
+-	var callPart, respPart map[string]any
+-	if err := json.Unmarshal([]byte(body.Contents[0].Parts[0]), &callPart); err != nil {
+-		t.Fatal(err)
++	// Top-level keys must survive verbatim.
++	if !strings.Contains(string(body.SystemInstruction), `"sys"`) {
++		t.Errorf("systemInstruction dropped: %s", body.SystemInstruction)
++	}
++	if !strings.Contains(string(body.GenerationConfig), `"temperature":0.7`) {
++		t.Errorf("generationConfig dropped: %s", body.GenerationConfig)
+ 	}
+-	if err := json.Unmarshal([]byte(body.Contents[1].Parts[0]), &respPart); err != nil {
+-		t.Fatal(err)
++	if !strings.Contains(string(body.Tools), `"fs_read"`) {
++		t.Errorf("tools dropped: %s", body.Tools)
+ 	}
+ 
+-	if sig, _ := callPart["thoughtSignature"].(string); sig != DefaultVertexThinkingSignature {
++	// Roles must survive on every turn.
++	var parts0, parts1, parts2 map[string]any
++	for i, want := range []string{"model", "user", "user"} {
++		var turn struct {
++			Role  string `json:"role"`
++			Parts []map[string]any `json:"parts"`
++		}
++		if err := json.Unmarshal(body.Contents[i], &turn); err != nil {
++			t.Fatalf("turn %d: %v", i, err)
++		}
++		if turn.Role != want {
++			t.Errorf("contents[%d].role = %q, want %q (role dropped?)", i, turn.Role, want)
++		}
++		if i == 0 {
++			if len(turn.Parts) != 1 {
++				t.Fatalf("call turn parts: %v", turn.Parts)
++			}
++			parts0 = turn.Parts[0]
++		} else if i == 1 {
++			parts1 = turn.Parts[0]
++		} else {
++			parts2 = turn.Parts[0]
++		}
++	}
++
++	if sig, _ := parts0["thoughtSignature"].(string); sig != DefaultVertexThinkingSignature {
+ 		t.Fatalf("thoughtSignature not replaced with vertex default: %.40s", sig)
+ 	}
+-	call, _ := callPart["functionCall"].(map[string]any)
++	call, _ := parts0["functionCall"].(map[string]any)
+ 	if call == nil {
+-		t.Fatalf("functionCall lost: %v", callPart)
++		t.Fatalf("functionCall lost: %v", parts0)
+ 	}
+ 	if _, has := call["id"]; has {
+ 		t.Fatalf("functionCall.id not stripped: %v", call)
+@@ -161,13 +199,16 @@ func TestPostProcessVertexBodyStripsIDsAndReplacesSignature(t *testing.T) {
+ 	if call["name"] != "fs_read" {
+ 		t.Fatalf("functionCall.name lost: %v", call)
+ 	}
+-	resp, _ := respPart["functionResponse"].(map[string]any)
++	resp, _ := parts1["functionResponse"].(map[string]any)
+ 	if resp == nil {
+-		t.Fatalf("functionResponse lost: %v", respPart)
++		t.Fatalf("functionResponse lost: %v", parts1)
+ 	}
+ 	if _, has := resp["id"]; has {
+ 		t.Fatalf("functionResponse.id not stripped: %v", resp)
+ 	}
++	if _, ok := parts2["text"]; !ok {
++		t.Fatalf("plain text part lost: %v", parts2)
++	}
+ 
+ 	// Idempotent: a second pass must not change anything.
+ 	if again := postProcessVertexBody(out); string(again) != string(out) {
