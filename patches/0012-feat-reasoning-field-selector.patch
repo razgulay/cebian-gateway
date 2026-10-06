@@ -1,0 +1,294 @@
+From d6cd710fb97899ac60d9403f82358cbc2479697e Mon Sep 17 00:00:00 2001
+From: razgulay <bantran09@outlook.com>
+Date: Tue, 6 Oct 2026 08:11:30 +0700
+Subject: [PATCH 12/12] =?UTF-8?q?feat(translator):=20REASONING=5FFIELD=20?=
+ =?UTF-8?q?=E2=80=94=20selectable=20thinking=20field=20for=20the=20OpenAI?=
+ =?UTF-8?q?=20output?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The wire capture proved the gemini-native lanes are clean: thought-flagged
+parts go to reasoning_content, never content. The 'analysis leaking into
+the chat' report is a client-side rendering mismatch — clients that do not
+know reasoning_content either drop the thinking or print it as text, which
+is why only thinking models (gemini-3.8-flash-tiered always thinks) show
+it and always right before their tool calls.
+
+REASONING_FIELD picks the delta/message field the operator's client
+understands: reasoning_content (default, unchanged), reasoning, both, or
+none (suppress entirely). Applies to both the stream deltas and the
+non-stream message on the gemini-native lanes; Claude-format caveat
+documented.
+---
+ internal/translator/gemini.go               |  19 ++--
+ internal/translator/reasoning_field.go      |  93 ++++++++++++++++
+ internal/translator/reasoning_field_test.go | 113 ++++++++++++++++++++
+ 3 files changed, 216 insertions(+), 9 deletions(-)
+ create mode 100644 internal/translator/reasoning_field.go
+ create mode 100644 internal/translator/reasoning_field_test.go
+
+diff --git a/internal/translator/gemini.go b/internal/translator/gemini.go
+index 157bfdb..909e3f1 100644
+--- a/internal/translator/gemini.go
++++ b/internal/translator/gemini.go
+@@ -662,10 +662,9 @@ func TranslateGeminiResponseToOpenAI(geminiBody []byte) ([]byte, *OpenAIUsage, e
+ 		"choices": []map[string]any{{
+ 			"index": 0,
+ 			"message": map[string]any{
+-				"role":              "assistant",
+-				"content":           openaiContent,
+-				"reasoning_content": reasoningContent,
+-				"tool_calls":        toolCalls,
++				"role":       "assistant",
++				"content":    openaiContent,
++				"tool_calls": toolCalls,
+ 			},
+ 			"finish_reason": claudeStop,
+ 		}},
+@@ -679,12 +678,14 @@ func TranslateGeminiResponseToOpenAI(geminiBody []byte) ([]byte, *OpenAIUsage, e
+ 		},
+ 	}
+ 
++	// Reasoning goes out under the REASONING_FIELD-selected name(s) — or is
++	// suppressed entirely for clients that render unknown fields as text.
++	msg := resp["choices"].([]map[string]any)[0]["message"].(map[string]any)
++	applyNonStreamReasoningField(msg, reasoningContent)
++
+ 	// Remove empty fields
+-	if reasoningContent == "" {
+-		delete(resp["choices"].([]map[string]any)[0]["message"].(map[string]any), "reasoning_content")
+-	}
+ 	if len(toolCalls) == 0 {
+-		delete(resp["choices"].([]map[string]any)[0]["message"].(map[string]any), "tool_calls")
++		delete(msg, "tool_calls")
+ 	}
+ 
+ 	out, err := json.Marshal(resp)
+@@ -752,7 +753,7 @@ func TranslateGeminiChunkToOpenAI(chunk []byte, state *GeminiStreamState) ([]byt
+ 					delta["content"] = part.Text
+ 				}
+ 				if part.Text != "" && part.Thought != nil && *part.Thought {
+-					delta["reasoning_content"] = part.Text
++					applyStreamReasoningField(delta, part.Text)
+ 				}
+ 				if part.FunctionCall != nil {
+ 					args, err := json.Marshal(part.FunctionCall.Args)
+diff --git a/internal/translator/reasoning_field.go b/internal/translator/reasoning_field.go
+new file mode 100644
+index 0000000..6dc5422
+--- /dev/null
++++ b/internal/translator/reasoning_field.go
+@@ -0,0 +1,93 @@
++package translator
++
++import (
++	"os"
++	"strings"
++)
++
++// REASONING_FIELD selects which field carries the model's thinking on the
++// OpenAI-compatible output (stream deltas and non-stream messages) for the
++// Gemini-native lanes.
++//
++// Not every OpenAI-compatible client reads the same name, and a client that
++// does not know a field either drops the thinking (harmless) or — worse —
++// renders it as visible text ("the analysis leaks into the chat"). The wire
++// itself is correct: thought-flagged parts were never content. This switch
++// lets an operator match the client instead of patching the client:
++//
++//	reasoning_content (default) — DeepSeek / OpenRouter convention
++//	reasoning                   — Ollama / o-series style field
++//	both                        — emit both names
++//	none                        — suppress thinking entirely (clients that
++//	                              render every unknown field as text)
++//
++// Caveat: Claude-format clients served THROUGH the Gemini lanes read the
++// wire field to build their native thinking blocks, so modes other than the
++// default (and "both") change or drop what those clients display.
++type reasoningFieldMode int
++
++const (
++	reasoningFieldContent reasoningFieldMode = iota
++	reasoningFieldReasoning
++	reasoningFieldBoth
++	reasoningFieldNone
++)
++
++// reasoningFieldOverride exists for tests; production reads the env once.
++var reasoningFieldOverride *reasoningFieldMode
++
++func ReasoningFieldMode() reasoningFieldMode {
++	if reasoningFieldOverride != nil {
++		return *reasoningFieldOverride
++	}
++	switch strings.ToLower(strings.TrimSpace(os.Getenv("REASONING_FIELD"))) {
++	case "reasoning":
++		return reasoningFieldReasoning
++	case "both":
++		return reasoningFieldBoth
++	case "none":
++		return reasoningFieldNone
++	default:
++		return reasoningFieldContent
++	}
++}
++
++// applyStreamReasoningField writes one streamed thinking delta into the
++// chunk under the configured field name(s).
++func applyStreamReasoningField(delta map[string]any, text string) {
++	switch ReasoningFieldMode() {
++	case reasoningFieldNone:
++		return
++	case reasoningFieldReasoning:
++		delta["reasoning"] = text
++	case reasoningFieldBoth:
++		delta["reasoning_content"] = text
++		delta["reasoning"] = text
++	default:
++		delta["reasoning_content"] = text
++	}
++}
++
++// applyNonStreamReasoningField writes the assembled thinking text into a
++// non-stream response message under the configured field name(s), deleting
++// whichever name(s) the mode does not use so no half-shaped field leaks.
++// Empty thinking leaves the message without any reasoning field — the shape
++// the pre-selector code produced.
++func applyNonStreamReasoningField(message map[string]any, text string) {
++	delete(message, "reasoning_content")
++	delete(message, "reasoning")
++	if text == "" {
++		return
++	}
++	switch ReasoningFieldMode() {
++	case reasoningFieldNone:
++		return
++	case reasoningFieldReasoning:
++		message["reasoning"] = text
++	case reasoningFieldBoth:
++		message["reasoning_content"] = text
++		message["reasoning"] = text
++	default:
++		message["reasoning_content"] = text
++	}
++}
+diff --git a/internal/translator/reasoning_field_test.go b/internal/translator/reasoning_field_test.go
+new file mode 100644
+index 0000000..a3ae3bb
+--- /dev/null
++++ b/internal/translator/reasoning_field_test.go
+@@ -0,0 +1,113 @@
++package translator
++
++import (
++	"strings"
++	"testing"
++)
++
++// REASONING_FIELD lets an operator match the client's thinking-field name.
++// The wire was never wrong — thought-flagged parts never went to content —
++// but a client that does not know `reasoning_content` renders the analysis
++// as visible text. These tests pin the selector for stream deltas and
++// non-stream messages.
++
++func withReasoningField(t *testing.T, mode reasoningFieldMode) {
++	t.Helper()
++	reasoningFieldOverride = &mode
++	t.Cleanup(func() { reasoningFieldOverride = nil })
++}
++
++func TestStreamReasoningFieldDefaultIsReasoningContent(t *testing.T) {
++	withReasoningField(t, reasoningFieldContent)
++	delta := map[string]any{}
++	applyStreamReasoningField(delta, "thinking")
++	if delta["reasoning_content"] != "thinking" {
++		t.Errorf("reasoning_content = %v", delta["reasoning_content"])
++	}
++	if _, has := delta["reasoning"]; has {
++		t.Error("default mode must not emit reasoning")
++	}
++	if _, has := delta["content"]; has {
++		t.Error("thinking must not touch content")
++	}
++}
++
++func TestStreamReasoningFieldModes(t *testing.T) {
++	withReasoningField(t, reasoningFieldReasoning)
++	delta := map[string]any{}
++	applyStreamReasoningField(delta, "t")
++	if delta["reasoning"] != "t" || delta["reasoning_content"] != nil {
++		t.Fatalf("reasoning mode delta = %v", delta)
++	}
++
++	withReasoningField(t, reasoningFieldBoth)
++	delta = map[string]any{}
++	applyStreamReasoningField(delta, "t")
++	if delta["reasoning"] != "t" || delta["reasoning_content"] != "t" {
++		t.Fatalf("both mode delta = %v", delta)
++	}
++
++	withReasoningField(t, reasoningFieldNone)
++	delta = map[string]any{}
++	applyStreamReasoningField(delta, "t")
++	if len(delta) != 0 {
++		t.Fatalf("none mode delta = %v", delta)
++	}
++}
++
++func TestNonStreamReasoningFieldModes(t *testing.T) {
++	withReasoningField(t, reasoningFieldContent)
++	msg := map[string]any{}
++	applyNonStreamReasoningField(msg, "thinking")
++	if msg["reasoning_content"] != "thinking" {
++		t.Fatalf("content mode msg = %v", msg)
++	}
++
++	// Empty thinking leaves no reasoning field (pre-selector shape).
++	msg = map[string]any{"reasoning_content": "stale"}
++	applyNonStreamReasoningField(msg, "")
++	if _, has := msg["reasoning_content"]; has {
++		t.Fatalf("empty thinking must leave no field: %v", msg)
++	}
++
++	withReasoningField(t, reasoningFieldReasoning)
++	msg = map[string]any{"reasoning_content": "stale"}
++	applyNonStreamReasoningField(msg, "thinking")
++	if msg["reasoning"] != "thinking" {
++		t.Fatalf("reasoning mode msg = %v", msg)
++	}
++	if _, has := msg["reasoning_content"]; has {
++		t.Fatalf("stale reasoning_content survived: %v", msg)
++	}
++
++	withReasoningField(t, reasoningFieldNone)
++	msg = map[string]any{}
++	applyNonStreamReasoningField(msg, "thinking")
++	if len(msg) != 0 {
++		t.Fatalf("none mode msg = %v", msg)
++	}
++}
++
++// End-to-end: the stream translator routes a thought-flagged part under the
++// selected field, and content stays untouched in every mode.
++func TestTranslateGeminiChunkToOpenAI_ReasoningFieldSelected(t *testing.T) {
++	chunk := []byte(`{"candidates":[{"content":{"role":"model","parts":[
++		{"thought":true,"text":"analysis"},
++		{"text":"answer"}
++	]}}]}`)
++
++	withReasoningField(t, reasoningFieldReasoning)
++	out, err := TranslateGeminiChunkToOpenAI(chunk, &GeminiStreamState{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !strings.Contains(string(out), `"reasoning":"analysis"`) {
++		t.Fatalf("reasoning field missing: %s", out)
++	}
++	if !strings.Contains(string(out), `"content":"answer"`) {
++		t.Fatalf("content lost: %s", out)
++	}
++	if strings.Contains(string(out), `"content":"analysis"`) {
++		t.Fatalf("analysis leaked into content: %s", out)
++	}
++}
