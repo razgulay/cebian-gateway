@@ -13,8 +13,8 @@
 // assets. So we route those three exactly and leave the rest to the router.
 // That keeps the Telegram webhook URL and the extension's WS URL unchanged.
 //
-//   /health | /webhook/telegram | /ws  -> gateway :8001
-//   everything else                    -> router  :20130 (dashboard, /v1, /api)
+//   /health | /webhook/telegram | /webhook/telegram_automation | /ws  -> gateway :8001
+//   everything else                                                    -> router  :20130 (dashboard, /v1, /api)
 
 import http from 'node:http';
 
@@ -23,7 +23,12 @@ const ROUTER_PORT = Number(process.env.ROUTER_PORT || 20130);
 const GATEWAY_PORT = Number(process.env.GATEWAY_PORT || 8001);
 
 // Exact paths the Telegram gateway owns. Keep in sync with server.js.
-const GATEWAY_PATHS = new Set(['/health', '/webhook/telegram', '/ws']);
+const GATEWAY_PATHS = new Set([
+  '/health',
+  '/webhook/telegram',
+  '/webhook/telegram_automation',
+  '/ws',
+]);
 
 /** Gateway wins on an exact path match; everything else goes to the router. */
 function pickBackend(pathname) {
@@ -91,6 +96,6 @@ server.on('upgrade', (req, socket, head) => {
 
 server.listen(LISTEN_PORT, '0.0.0.0', () => {
   console.log(
-    `[proxy] listening on 0.0.0.0:${LISTEN_PORT} | /health,/webhook/telegram,/ws -> gateway :${GATEWAY_PORT} | /* -> router :${ROUTER_PORT}`,
+    `[proxy] listening on 0.0.0.0:${LISTEN_PORT} | /health,/webhook/telegram,/webhook/telegram_automation,/ws -> gateway :${GATEWAY_PORT} | /* -> router :${ROUTER_PORT}`,
   );
 });
