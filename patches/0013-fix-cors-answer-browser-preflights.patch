@@ -1,0 +1,270 @@
+From 4c48b7d6b7fb8306f3a1c0cbe619c02a16482a58 Mon Sep 17 00:00:00 2001
+From: razgulay <bantran09@outlook.com>
+Date: Mon, 12 Oct 2026 19:10:28 +0700
+Subject: [PATCH] =?UTF-8?q?fix(cors):=20answer=20browser=20preflights=20?=
+ =?UTF-8?q?=E2=80=94=20add=20CORS=20middleware=20for=20/v1/*?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The gateway emitted no CORS headers at all and chi's route tree answered
+preflight OPTIONS /v1/messages with 405 (Allow: POST), so every
+browser-based client (Claude for Office webview, web apps) died at
+preflight with a bare "Failed to fetch". curl/SDK clients never noticed
+because they do not enforce CORS.
+
+internal/middleware.CORS, mounted right after RequestID in
+internal/app.ProvideRouter:
+- preflight (OPTIONS + Origin) answered 204 before routing, so it can
+  never fall through to chi's 405; allow-headers echo the browser's
+  Access-Control-Request-Headers when present, else the known set
+  (x-api-key, authorization, content-type, anthropic-version,
+  anthropic-beta); Access-Control-Max-Age=86400 caches it.
+- real requests carrying an Origin get Access-Control-Allow-Origin
+  reflected (not "*", so credentialed requests stay possible) plus
+  Vary: Origin.
+- no Origin (curl, SDKs) — untouched.
+
+Auth is per-request x-api-key, not cookies, so no
+Access-Control-Allow-Credentials: an origin needs the header value to
+get anywhere, and reflecting its own Origin grants nothing extra.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ internal/app/handlers.go         |   4 +
+ internal/middleware/cors.go      |  69 ++++++++++++++++
+ internal/middleware/cors_test.go | 131 +++++++++++++++++++++++++++++++
+ 3 files changed, 204 insertions(+)
+ create mode 100644 internal/middleware/cors.go
+ create mode 100644 internal/middleware/cors_test.go
+
+diff --git a/internal/app/handlers.go b/internal/app/handlers.go
+index e4ac244..547f782 100644
+--- a/internal/app/handlers.go
++++ b/internal/app/handlers.go
+@@ -60,6 +60,10 @@ func ProvideTokenSaverConfig(repo *db.Repo, params CLIParams) *handlers.TokenSav
+ func ProvideRouter(repo *db.Repo, ts *handlers.TokenSaverConfig) *chi.Mux {
+ 	r := chi.NewRouter()
+ 	r.Use(middleware.RequestID)
++	// CORS before auth/routing: preflight OPTIONS must answer 204 here, else
++	// chi's route tree 405s it (only POST/GET are registered on /v1/*) and
++	// every browser client dies at preflight with a bare "Failed to fetch".
++	r.Use(middleware.CORS)
+ 	r.Use(middleware.MaxBody(middleware.DefaultMaxBodySize))
+ 	r.Use(chiMiddleware.Recoverer)
+ 	r.Use(middleware.RequestLogger)
+diff --git a/internal/middleware/cors.go b/internal/middleware/cors.go
+new file mode 100644
+index 0000000..94fa6f6
+--- /dev/null
++++ b/internal/middleware/cors.go
+@@ -0,0 +1,69 @@
++package middleware
++
++import "net/http"
++
++// Preflight answer defaults, used when the browser does not name the headers
++// it intends to send (Access-Control-Request-Headers absent).
++const (
++	// corsAllowHeaders covers the auth + content headers API clients actually
++	// send (x-api-key for the gateway, anthropic-version/anthropic-beta for
++	// Anthropic-format clients). When a client sends others, the preflight
++	// branch echoes its Access-Control-Request-Headers instead, so a new
++	// client header never needs a server change.
++	corsAllowHeaders = "authorization, content-type, x-api-key, anthropic-version, anthropic-beta"
++	// corsAllowMethods: the engine API is GET (models) + POST (messages,
++	// completions, embeddings, ...). DELETE/PUT live behind the dashboard
++	// SPA, which is same-origin and needs no CORS.
++	corsAllowMethods = "GET, POST, OPTIONS"
++	// corsPreflightMaxAge lets the browser cache the preflight for a day so
++	// it stops paying the OPTIONS round-trip before every request.
++	corsPreflightMaxAge = "86400"
++)
++
++// CORS returns a middleware that lets browser-based clients (Claude for
++// Office webview, web apps) call the API cross-origin.
++//
++// Before this middleware the gateway emitted no CORS headers at all and chi
++// answered preflight OPTIONS /v1/messages with 405 (Allow: POST): the browser
++// blocked every cross-origin request at preflight, which surfaced client-side
++// only as "Failed to fetch". curl/SDK clients never noticed because they do
++// not enforce CORS.
++//
++// Behaviour:
++//   - Preflight (OPTIONS with an Origin): answered here with 204 before
++//     routing, so it can never fall through to chi's 405. The allow-headers
++//     follow the browser's Access-Control-Request-Headers when present.
++//   - Any other request carrying an Origin: tagged Access-Control-Allow-Origin
++//     with the request origin (reflected, not "*", so credentialed requests
++//     stay possible later) plus Vary: Origin so caches keep origins apart.
++//   - Requests without an Origin (curl, SDKs, same-origin GETs): untouched.
++//
++// Auth is per-request via the x-api-key header, not cookies, so no
++// Access-Control-Allow-Credentials — an origin needs the header value to get
++// anywhere, and reflecting its own Origin grants nothing extra.
++func CORS(next http.Handler) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		origin := r.Header.Get("Origin")
++		if origin == "" {
++			next.ServeHTTP(w, r)
++			return
++		}
++
++		w.Header().Set("Access-Control-Allow-Origin", origin)
++		w.Header().Add("Vary", "Origin")
++
++		if r.Method == http.MethodOptions {
++			if requested := r.Header.Get("Access-Control-Request-Headers"); requested != "" {
++				w.Header().Set("Access-Control-Allow-Headers", requested)
++			} else {
++				w.Header().Set("Access-Control-Allow-Headers", corsAllowHeaders)
++			}
++			w.Header().Set("Access-Control-Allow-Methods", corsAllowMethods)
++			w.Header().Set("Access-Control-Max-Age", corsPreflightMaxAge)
++			w.WriteHeader(http.StatusNoContent)
++			return
++		}
++
++		next.ServeHTTP(w, r)
++	})
++}
+diff --git a/internal/middleware/cors_test.go b/internal/middleware/cors_test.go
+new file mode 100644
+index 0000000..1bbcf31
+--- /dev/null
++++ b/internal/middleware/cors_test.go
+@@ -0,0 +1,131 @@
++package middleware
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/go-chi/chi/v5"
++)
++
++func TestCORS_PreflightEchoesRequestedHeaders(t *testing.T) {
++	nextCalled := false
++	handler := CORS(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		nextCalled = true
++		w.WriteHeader(http.StatusOK)
++	}))
++
++	req := httptest.NewRequest("OPTIONS", "/v1/messages", nil)
++	req.Header.Set("Origin", "https://example.com")
++	req.Header.Set("Access-Control-Request-Method", "POST")
++	req.Header.Set("Access-Control-Request-Headers", "x-api-key,content-type")
++	rec := httptest.NewRecorder()
++	handler.ServeHTTP(rec, req)
++
++	if nextCalled {
++		t.Error("preflight must be answered by the middleware, not routed onward")
++	}
++	if rec.Code != http.StatusNoContent {
++		t.Errorf("expected 204 preflight answer, got %d", rec.Code)
++	}
++	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://example.com" {
++		t.Errorf("expected reflected Origin, got %q", got)
++	}
++	if got := rec.Header().Get("Access-Control-Allow-Headers"); got != "x-api-key,content-type" {
++		t.Errorf("expected echoed Access-Control-Request-Headers, got %q", got)
++	}
++	if got := rec.Header().Get("Access-Control-Allow-Methods"); got != corsAllowMethods {
++		t.Errorf("expected allow-methods %q, got %q", corsAllowMethods, got)
++	}
++	if got := rec.Header().Get("Access-Control-Max-Age"); got != corsPreflightMaxAge {
++		t.Errorf("expected max-age %q, got %q", corsPreflightMaxAge, got)
++	}
++}
++
++func TestCORS_PreflightDefaultHeaders(t *testing.T) {
++	handler := CORS(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(http.StatusOK)
++	}))
++
++	req := httptest.NewRequest("OPTIONS", "/v1/messages", nil)
++	req.Header.Set("Origin", "https://example.com")
++	req.Header.Set("Access-Control-Request-Method", "POST")
++	rec := httptest.NewRecorder()
++	handler.ServeHTTP(rec, req)
++
++	if rec.Code != http.StatusNoContent {
++		t.Errorf("expected 204 preflight answer, got %d", rec.Code)
++	}
++	if got := rec.Header().Get("Access-Control-Allow-Headers"); got != corsAllowHeaders {
++		t.Errorf("expected default allow-headers %q, got %q", corsAllowHeaders, got)
++	}
++}
++
++func TestCORS_SimpleRequestWithOrigin(t *testing.T) {
++	handler := CORS(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(http.StatusOK)
++	}))
++
++	req := httptest.NewRequest("GET", "/v1/models", nil)
++	req.Header.Set("Origin", "https://example.com")
++	rec := httptest.NewRecorder()
++	handler.ServeHTTP(rec, req)
++
++	if rec.Code != http.StatusOK {
++		t.Errorf("expected the request to pass through, got %d", rec.Code)
++	}
++	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://example.com" {
++		t.Errorf("expected Access-Control-Allow-Origin on the actual response, got %q", got)
++	}
++	if got := rec.Header().Get("Vary"); got != "Origin" {
++		t.Errorf("expected Vary: Origin so caches keep origins apart, got %q", got)
++	}
++}
++
++func TestCORS_NoOriginUntouched(t *testing.T) {
++	handler := CORS(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(http.StatusOK)
++	}))
++
++	req := httptest.NewRequest("GET", "/v1/models", nil)
++	rec := httptest.NewRecorder()
++	handler.ServeHTTP(rec, req)
++
++	if rec.Code != http.StatusOK {
++		t.Errorf("expected pass-through, got %d", rec.Code)
++	}
++	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
++		t.Errorf("expected no CORS headers without an Origin, got %q", got)
++	}
++}
++
++// TestCORS_PreflightBeatsChi405 reproduces the reported bug end-to-end: chi
++// answers OPTIONS /v1/messages with 405 (Allow: POST) because only POST is
++// registered, and the browser aborts the whole request on a non-2xx
++// preflight. With CORS in front of the mux the same request must answer 204.
++func TestCORS_PreflightBeatsChi405(t *testing.T) {
++	r := chi.NewRouter()
++	r.Post("/v1/messages", func(w http.ResponseWriter, r *http.Request) {})
++
++	bare := httptest.NewRequest("OPTIONS", "/v1/messages", nil)
++	recBare := httptest.NewRecorder()
++	r.ServeHTTP(recBare, bare)
++	if recBare.Code != http.StatusMethodNotAllowed {
++		t.Fatalf("expected chi's stock 405 without CORS (documents the bug), got %d", recBare.Code)
++	}
++
++	wrapped := CORS(r)
++	req := httptest.NewRequest("OPTIONS", "/v1/messages", nil)
++	req.Header.Set("Origin", "https://example.com")
++	req.Header.Set("Access-Control-Request-Method", "POST")
++	req.Header.Set("Access-Control-Request-Headers", "x-api-key,content-type")
++	rec := httptest.NewRecorder()
++	wrapped.ServeHTTP(rec, req)
++
++	if rec.Code != http.StatusNoContent {
++		t.Errorf("expected 204 preflight through a chi mux, got %d", rec.Code)
++	}
++	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://example.com" {
++		t.Errorf("expected reflected Origin, got %q", got)
++	}
++}
+-- 
+2.52.0.windows.1
+

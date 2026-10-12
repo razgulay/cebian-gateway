@@ -29,7 +29,11 @@
 # generationConfig) from the request, 0010 re-establishes the
 # terminal-user guarantee on the final vertex wire body (Gemini/Vertex
 # reject a contents array ending with a model turn) and dumps every vertex
-# 400 payload to /tmp for post-mortem.
+# 400 payload to /tmp for post-mortem, 0013 adds a CORS middleware
+# (internal/middleware.CORS): the gateway previously emitted no CORS headers
+# and chi answered preflight OPTIONS /v1/messages with 405, so every
+# browser-based client (Claude for Office webview, web apps) died with a bare
+# "Failed to fetch" while curl/SDK clients worked fine.
 # These are git-format diffs against the pinned upstream SHA, so the router
 # must be compiled here. The v1.9.9 prebuilt release binary on GitHub contains
 # none of them. A prebuilt download was tried on 2026-09-29 (commits 4a44423 /
@@ -76,6 +80,8 @@ RUN apk add --no-cache curl tar patch \
  && grep -q "EnsureGeminiTerminalUserTurn" internal/translator/gemini.go \
  && grep -q "GEMINI_STREAM_DEBUG" internal/handlers/chat/gemini_stream_debug.go \
  && grep -q "applyStreamReasoningField" internal/translator/reasoning_field.go \
+ && grep -q "corsPreflightMaxAge" internal/middleware/cors.go \
+ && grep -q "middleware.CORS" internal/app/handlers.go \
  && echo "[patch] all fix markers present"
 
 # ── Build the dashboard SPA (bun + Vite) ─────────────────────────────────────
