@@ -1,110 +1,3 @@
-From 14d69afbb5a160a7e33e6daf0977b67b32321494 Mon Sep 17 00:00:00 2001
-From: razgulay <bantran09@outlook.com>
-Date: Mon, 5 Oct 2026 12:30:58 +0700
-Subject: [PATCH 4/4] feat(vertex): port the Vertex AI chat forwarding lane
- (fixes gemini-3.1-pro-preview 404)
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-The catalog shipped vertex/vertex-partner with models and dashboard
-entries but no executor, so chat fell through to the generic OpenAI
-forwarder which POSTed the registry BaseURL verbatim — bare
-https://aiplatform.googleapis.com/v1 — and Google answered with its HTML
-'404: The requested URL /v1 was not found on this server.' page for
-every model, gemini-3.1-pro-preview included.
-
-Port of open-sse/executors/vertex.js + translator/request/openai-to-vertex.js:
-- vertex: Gemini-native generateContent / streamGenerateContent?alt=sse
-  against publishers/google/models — project-scoped regional path for
-  OAuth, global publishers endpoint + ?key= for express API keys.
-- vertex-partner: OpenAI-compatible global openapi endpoint behind the
-  project-scoped path, delegated to the generic forwarder with the final
-  URL baked in.
-- Auth: Service Account JSON (RS256 JWT assertion → Bearer, cached per
-  client_email), ADC authorized_user JSON (refresh_token grant, cached
-  per token), express raw key (?key=), or a pre-set accessToken.
-- Body: TranslateOpenAIToGemini, then postProcessForVertex parity —
-  thoughtSignature replaced with the Vertex-native default and
-  functionCall/functionResponse ids stripped (Vertex rejects both).
-- Registry BaseURL drops the /v1 suffix (host root, matching upstream).
----
- docs/DASHBOARD_PROVIDER_PARITY.md         |  21 +-
- internal/handlers/chat/fallback.go        |  12 +
- internal/handlers/chat/vertex_handler.go  | 110 ++++
- internal/providers/providers.go           |   8 +-
- internal/proxy/vertex.go                  | 582 ++++++++++++++++++++++
- internal/proxy/vertex_test.go             | 238 +++++++++
- internal/proxy/vertex_testhelpers_test.go |  36 ++
- 7 files changed, 1000 insertions(+), 7 deletions(-)
- create mode 100644 internal/handlers/chat/vertex_handler.go
- create mode 100644 internal/proxy/vertex.go
- create mode 100644 internal/proxy/vertex_test.go
- create mode 100644 internal/proxy/vertex_testhelpers_test.go
-
-diff --git a/docs/DASHBOARD_PROVIDER_PARITY.md b/docs/DASHBOARD_PROVIDER_PARITY.md
-index de60dcb..52c5d35 100644
---- a/docs/DASHBOARD_PROVIDER_PARITY.md
-+++ b/docs/DASHBOARD_PROVIDER_PARITY.md
-@@ -360,12 +360,23 @@ Pendukung: `executor.BuildQoderCosyHeaders` sekarang **publik** dan menghitung
- sebelumnya hardcode `/api/v2/service/pro/sse/agent_chat_generation`. Nilai untuk
- URL chat tidak berubah (dikunci `qoder_cosy_test.go`).
- 
--**Belum diport** (di luar key-validate): `vertex`/`vertex-partner` (SA JSON vs raw
--key), `grok-web`-style STATSIG refresh, `commandcode`/`qoder` chat-probe khusus,
--`blackbox`, `deepgram Token`, `opencode-go`, `xai` 403-as-valid, dan `validateUrl`
--spesifik per provider (deepseek `/user/balance`, dll.). Untuk provider ini generic
--`/models` + fallback chat dipakai; hasilnya tetap benar untuk 401/403 tapi pesan
-+**Belum diport** (di luar key-validate): `grok-web`-style STATSIG refresh,
-+`commandcode`/`qoder` chat-probe khusus, `blackbox`, `deepgram Token`,
-+`opencode-go`, `xai` 403-as-valid, dan `validateUrl` spesifik per provider
-+(deepseek `/user/balance`, dll.). Untuk provider ini generic `/models` +
-+fallback chat dipakai; hasilnya tetap benar untuk 401/403 tapi pesan
- gagalnya generik.
-+
-+**Sudah diport belakangan** (`internal/proxy/vertex.go` + `chat/vertex_handler.go`,
-+paritas `open-sse/executors/vertex.js`): chat forwarding `vertex`/`vertex-partner`.
-+Tanpa ini, generic forwarder POST base URL persis (`/v1` telanjang di
-+aiplatform.googleapis.com) dan Google membalas halaman HTML 404 untuk semua
-+model — `gemini-3.1-pro-preview` termasuk. Kini: SA JSON (JWT RS256 → Bearer,
-+cache per client_email), ADC `authorized_user` (refresh_token grant), dan raw
-+API key (express `?key=`); `vertex` lewat endpoint Gemini-native
-+(`publishers/google/models` project-scoped untuk OAuth, global untuk express
-+key), `vertex-partner` lewat endpoint openai-compatible
-+(`endpoints/openapi/chat/completions`). Key-validate tetap generic.
- - Hint upstream *"Legacy manual proxy fields are still accepted by API…"* tidak
-   ditampilkan: backend Go tidak punya field proxy legacy.
- - `reorderInTx` upstream (renumber priority per provider setelah insert) tidak
-diff --git a/internal/handlers/chat/fallback.go b/internal/handlers/chat/fallback.go
-index be9ad68..741ac47 100644
---- a/internal/handlers/chat/fallback.go
-+++ b/internal/handlers/chat/fallback.go
-@@ -490,6 +490,12 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
- 		fwdErr = exec(w, execReq)
- 	} else if providerCfg.IsGeminiNative() {
- 		fwdErr = h.forwardGeminiNativeRequest(ctx, w, provider, providerCfg, apiKey, connectionID, pipedBody, isStream, translateResponse, metrics, httpClient)
-+	} else if isVertexProvider(provider) {
-+		var psd map[string]any
-+		if connData != nil {
-+			psd = connData.ProviderSpecificData
-+		}
-+		fwdErr = h.forwardVertexRequest(ctx, w, provider, providerCfg, apiKey, pipedBody, isStream, translateResponse, metrics, httpClient, model, psd)
- 	} else {
- 		fwdErr = h.forwardRequest(ctx, w, providerCfg, apiKey, pipedBody, isStream, translateResponse, metrics, httpClient)
- 	}
-@@ -535,6 +541,12 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
- 				fwdErr = exec(w, retryReq)
- 			} else if providerCfg.IsGeminiNative() {
- 				fwdErr = h.forwardGeminiNativeRequest(ctx, w, provider, providerCfg, apiKey, connectionID, pipedBody, isStream, translateResponse, metrics, httpClient)
-+			} else if isVertexProvider(provider) {
-+				var psd map[string]any
-+				if connData != nil {
-+					psd = connData.ProviderSpecificData
-+				}
-+				fwdErr = h.forwardVertexRequest(ctx, w, provider, providerCfg, apiKey, pipedBody, isStream, translateResponse, metrics, httpClient, model, psd)
- 			} else {
- 				fwdErr = h.forwardRequest(ctx, w, providerCfg, apiKey, pipedBody, isStream, translateResponse, metrics, httpClient)
- 			}
 diff --git a/internal/handlers/chat/vertex_handler.go b/internal/handlers/chat/vertex_handler.go
 new file mode 100644
 index 0000000..c425f0f
@@ -221,36 +114,12 @@ index 0000000..c425f0f
 +	log.Debug("vertex", "partner request", "url", finalURL)
 +	return h.forwardRequest(ctx, w, &cfg, key, body, isStream, translateResponse, metrics, httpClient)
 +}
-diff --git a/internal/providers/providers.go b/internal/providers/providers.go
-index 507483f..a00df99 100644
---- a/internal/providers/providers.go
-+++ b/internal/providers/providers.go
-@@ -816,13 +816,17 @@ var KnownProviders = map[string]ProviderConfig{
- 		AuthHeader: "Authorization",
- 		AuthScheme: "bearer",
- 	},
-+	// Host root only — path building lives in internal/proxy/vertex.go, which
-+	// appends /v1/publishers/... (express keys) or /v1/projects/... (OAuth).
-+	// The old /v1 suffix here made the generic forwarder POST the bare
-+	// version segment and collect Google's HTML 404 for every model.
- 	"vertex": {
--		BaseURL:    "https://aiplatform.googleapis.com/v1",
-+		BaseURL:    "https://aiplatform.googleapis.com",
- 		AuthHeader: "Authorization",
- 		AuthScheme: "bearer",
- 	},
- 	"vertex-partner": {
--		BaseURL:    "https://aiplatform.googleapis.com/v1",
-+		BaseURL:    "https://aiplatform.googleapis.com",
- 		AuthHeader: "Authorization",
- 		AuthScheme: "bearer",
- 	},
 diff --git a/internal/proxy/vertex.go b/internal/proxy/vertex.go
 new file mode 100644
-index 0000000..b5497a4
+index 0000000..29f2234
 --- /dev/null
 +++ b/internal/proxy/vertex.go
-@@ -0,0 +1,582 @@
+@@ -0,0 +1,624 @@
 +package proxy
 +
 +import (
@@ -266,11 +135,14 @@ index 0000000..b5497a4
 +	"io"
 +	"net/http"
 +	"net/url"
++	"os"
++	"path/filepath"
 +	"regexp"
 +	"strings"
 +	"sync"
 +	"time"
 +
++	"encoding/json/jsontext"
 +	json "encoding/json/v2"
 +
 +	"9router/proxy/internal/constants"
@@ -709,17 +581,31 @@ index 0000000..b5497a4
 +// postProcessVertexBody adapts a Gemini-format body to Vertex: replace every
 +// thoughtSignature with the Vertex-native one and strip the id from
 +// functionCall/functionResponse parts (Vertex rejects ids).
++// postProcessVertexBody adapts a Gemini-format body to Vertex: replace every
++// thoughtSignature with the Vertex-native one and strip the id from
++// functionCall/functionResponse parts (Vertex rejects ids).
++//
++// The edit is surgical — the document is parsed as a top-level map of raw
++// JSON and only contents[].parts maps are rewritten. An earlier version
++// parsed into a struct that only carried contents[].parts and re-marshaled
++// THAT, silently dropping the role on every content (Google's 400 "Please
++// use a valid role: user, model.") plus systemInstruction, tools,
++// toolConfig and generationConfig from the whole request.
 +func postProcessVertexBody(body []byte) []byte {
-+	var parsed struct {
-+		Contents []struct {
-+			Parts []map[string]any `json:"parts"`
-+		} `json:"contents"`
++	var doc map[string]jsontext.Value
++	if err := json.Unmarshal(body, &doc); err != nil {
++		return body
 +	}
-+	if err := json.Unmarshal(body, &parsed); err != nil {
++	rawContents, ok := doc["contents"]
++	if !ok || !jsontext.Value(rawContents).IsValid() {
++		return body
++	}
++	var contents []vertexPostProcessContents
++	if err := json.Unmarshal(rawContents, &contents); err != nil {
 +		return body
 +	}
 +	changed := false
-+	for _, turn := range parsed.Contents {
++	for _, turn := range contents {
 +		for _, part := range turn.Parts {
 +			// Only rewrite on a real difference: a body that is already
 +			// Vertex-processed (default signature, ids gone) must pass through
@@ -745,11 +631,23 @@ index 0000000..b5497a4
 +	if !changed {
 +		return body
 +	}
-+	out, err := json.Marshal(parsed)
++	out, err := json.Marshal(contents)
 +	if err != nil {
 +		return body
 +	}
-+	return out
++	doc["contents"] = jsontext.Value(out)
++	whole, err := json.Marshal(doc)
++	if err != nil {
++		return body
++	}
++	return whole
++}
++
++// vertexPostProcessContents keeps the role on every content turn — role is
++// mandatory on Vertex ("Please use a valid role: user, model.").
++type vertexPostProcessContents struct {
++	Role  string           `json:"role,omitempty"`
++	Parts []map[string]any `json:"parts"`
 +}
 +
 +// ── Entry points ────────────────────────────────────────────────────────────
@@ -804,6 +702,10 @@ index 0000000..b5497a4
 +	if err != nil {
 +		return nil, fmt.Errorf("translate to Gemini: %w", err)
 +	}
++	// Terminal-user gate BEFORE the vertex post-process, so a guard turn this
++	// synthesizes (functionResponse ids included) still gets the vertex id
++	// strip below.
++	geminiBody = translator.EnsureGeminiTerminalUserTurn(geminiBody)
 +	sendBody := postProcessVertexBody(geminiBody)
 +
 +	requestURL := vertexGeminiURL(vertexBaseHost(cfg.BaseURL), modelName, isStream, auth)
@@ -828,6 +730,15 @@ index 0000000..b5497a4
 +		if readErr != nil {
 +			return nil, fmt.Errorf("upstream returned %d and body read failed: %w", resp.StatusCode, readErr)
 +		}
++		// Dump every 400 payload for post-mortem — a schema rejection is only
++		// diagnosable against the exact body that drew it (same pattern as
++		// ForwardGemini's 400 dump). TempDir, not a hardcoded /tmp: the
++		// gateway also runs on Windows during local testing.
++		if resp.StatusCode == http.StatusBadRequest {
++			dumpPath := filepath.Join(os.TempDir(), "9router-vertex-400.json")
++			_ = os.WriteFile(dumpPath, sendBody, 0644)
++			log.Warn("vertex", "dumped 400 request", "path", dumpPath, "model", modelName, "bytes", len(sendBody))
++		}
 +		log.Warn("vertex", "upstream error", "model", modelName, "status", resp.StatusCode, "body", truncateErrBody(errBody))
 +		return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: errBody, Header: resp.Header}
 +	}
@@ -835,10 +746,10 @@ index 0000000..b5497a4
 +}
 diff --git a/internal/proxy/vertex_test.go b/internal/proxy/vertex_test.go
 new file mode 100644
-index 0000000..3f735b0
+index 0000000..d6403f5
 --- /dev/null
 +++ b/internal/proxy/vertex_test.go
-@@ -0,0 +1,238 @@
+@@ -0,0 +1,274 @@
 +package proxy
 +
 +import (
@@ -961,40 +872,76 @@ index 0000000..3f735b0
 +
 +// postProcessVertexBody must mirror openai-to-vertex.js: replace every
 +// thoughtSignature with the Vertex default and strip functionCall /
-+// functionResponse ids.
++// functionResponse ids — WITHOUT touching anything else in the document.
++// The first version parsed only contents[].parts and re-marshaled the whole
++// body, dropping the role on every content (400 "Please use a valid role:
++// user, model.") and every other top-level key (systemInstruction, tools,
++// generationConfig).
 +func TestPostProcessVertexBodyStripsIDsAndReplacesSignature(t *testing.T) {
-+	in := []byte(`{"contents":[
-+		{"role":"model","parts":[{"functionCall":{"name":"fs_read","id":"call_1","args":{"p":1}},"thoughtSignature":"AGSIG"}]},
-+		{"role":"user","parts":[{"functionResponse":{"name":"fs_read","id":"call_1","response":{"result":"ok"}}}]}
-+	]}`)
++	in := []byte(`{
++		"systemInstruction":{"parts":[{"text":"sys"}]},
++		"generationConfig":{"temperature":0.7,"maxOutputTokens":1024},
++		"tools":[{"functionDeclarations":[{"name":"fs_read"}]}],
++		"contents":[
++			{"role":"model","parts":[{"functionCall":{"name":"fs_read","id":"call_1","args":{"p":1}},"thoughtSignature":"AGSIG"}]},
++			{"role":"user","parts":[{"functionResponse":{"name":"fs_read","id":"call_1","response":{"result":"ok"}}}]},
++			{"role":"user","parts":[{"text":"hi"}]}
++		]
++	}`)
 +	out := postProcessVertexBody(in)
 +
 +	var body struct {
-+		Contents []struct {
-+			Parts []jsontext.Value `json:"parts"`
-+		} `json:"contents"`
++		SystemInstruction jsontext.Value   `json:"systemInstruction"`
++		GenerationConfig  jsontext.Value   `json:"generationConfig"`
++		Tools             jsontext.Value   `json:"tools"`
++		Contents          []jsontext.Value `json:"contents"`
 +	}
 +	if err := json.Unmarshal(out, &body); err != nil {
 +		t.Fatalf("reparse: %v", err)
 +	}
-+	if len(body.Contents) != 2 {
++	if len(body.Contents) != 3 {
 +		t.Fatalf("contents lost: %s", out)
 +	}
-+
-+	var callPart, respPart map[string]any
-+	if err := json.Unmarshal([]byte(body.Contents[0].Parts[0]), &callPart); err != nil {
-+		t.Fatal(err)
++	// Top-level keys must survive verbatim.
++	if !strings.Contains(string(body.SystemInstruction), `"sys"`) {
++		t.Errorf("systemInstruction dropped: %s", body.SystemInstruction)
 +	}
-+	if err := json.Unmarshal([]byte(body.Contents[1].Parts[0]), &respPart); err != nil {
-+		t.Fatal(err)
++	if !strings.Contains(string(body.GenerationConfig), `"temperature":0.7`) {
++		t.Errorf("generationConfig dropped: %s", body.GenerationConfig)
++	}
++	if !strings.Contains(string(body.Tools), `"fs_read"`) {
++		t.Errorf("tools dropped: %s", body.Tools)
 +	}
 +
-+	if sig, _ := callPart["thoughtSignature"].(string); sig != DefaultVertexThinkingSignature {
++	// Roles must survive on every turn.
++	var parts0, parts1 map[string]any
++	for i, want := range []string{"model", "user", "user"} {
++		var turn struct {
++			Role  string           `json:"role"`
++			Parts []map[string]any `json:"parts"`
++		}
++		if err := json.Unmarshal(body.Contents[i], &turn); err != nil {
++			t.Fatalf("turn %d: %v", i, err)
++		}
++		if turn.Role != want {
++			t.Errorf("contents[%d].role = %q, want %q (role dropped?)", i, turn.Role, want)
++		}
++		if i == 0 {
++			if len(turn.Parts) != 1 {
++				t.Fatalf("call turn parts: %v", turn.Parts)
++			}
++			parts0 = turn.Parts[0]
++		} else if i == 1 {
++			parts1 = turn.Parts[0]
++		}
++	}
++
++	if sig, _ := parts0["thoughtSignature"].(string); sig != DefaultVertexThinkingSignature {
 +		t.Fatalf("thoughtSignature not replaced with vertex default: %.40s", sig)
 +	}
-+	call, _ := callPart["functionCall"].(map[string]any)
++	call, _ := parts0["functionCall"].(map[string]any)
 +	if call == nil {
-+		t.Fatalf("functionCall lost: %v", callPart)
++		t.Fatalf("functionCall lost: %v", parts0)
 +	}
 +	if _, has := call["id"]; has {
 +		t.Fatalf("functionCall.id not stripped: %v", call)
@@ -1002,9 +949,9 @@ index 0000000..3f735b0
 +	if call["name"] != "fs_read" {
 +		t.Fatalf("functionCall.name lost: %v", call)
 +	}
-+	resp, _ := respPart["functionResponse"].(map[string]any)
++	resp, _ := parts1["functionResponse"].(map[string]any)
 +	if resp == nil {
-+		t.Fatalf("functionResponse lost: %v", respPart)
++		t.Fatalf("functionResponse lost: %v", parts1)
 +	}
 +	if _, has := resp["id"]; has {
 +		t.Fatalf("functionResponse.id not stripped: %v", resp)
@@ -1119,3 +1066,57 @@ index 0000000..86186a1
 +	}
 +	return string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))
 +}
+diff --git a/internal/providers/providers.go b/internal/providers/providers.go
+index 87d601a..593f5af 100644
+--- a/internal/providers/providers.go
++++ b/internal/providers/providers.go
+@@ -979,13 +979,17 @@ var KnownProviders = map[string]ProviderConfig{
+ 		AuthHeader: "Authorization",
+ 		AuthScheme: "bearer",
+ 	},
++	// Host root only — path building lives in internal/proxy/vertex.go, which
++	// appends /v1/publishers/... (express keys) or /v1/projects/... (OAuth).
++	// The old /v1 suffix here made the generic forwarder POST the bare
++	// version segment and collect Google's HTML 404 for every model.
+ 	"vertex": {
+-		BaseURL:    "https://aiplatform.googleapis.com/v1",
++		BaseURL:    "https://aiplatform.googleapis.com",
+ 		AuthHeader: "Authorization",
+ 		AuthScheme: "bearer",
+ 	},
+ 	"vertex-partner": {
+-		BaseURL:    "https://aiplatform.googleapis.com/v1",
++		BaseURL:    "https://aiplatform.googleapis.com",
+ 		AuthHeader: "Authorization",
+ 		AuthScheme: "bearer",
+ 	},
+diff --git a/internal/handlers/chat/fallback.go b/internal/handlers/chat/fallback.go
+index ff0f2a4..c671fd2 100644
+--- a/internal/handlers/chat/fallback.go
++++ b/internal/handlers/chat/fallback.go
+@@ -709,6 +709,12 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
+ 		fwdErr = exec(w, execReq)
+ 	} else if providerCfg.IsGeminiNative() {
+ 		fwdErr = h.forwardGeminiNativeRequest(ctx, w, provider, providerCfg, apiKey, connectionID, pipedBody, isStream, translateResponse, metrics, httpClient)
++	} else if isVertexProvider(provider) {
++		var psd map[string]any
++		if connData != nil {
++			psd = connData.ProviderSpecificData
++		}
++		fwdErr = h.forwardVertexRequest(ctx, w, provider, providerCfg, apiKey, pipedBody, isStream, translateResponse, metrics, httpClient, model, psd)
+ 	} else {
+ 		fwdErr = h.forwardRequest(ctx, w, providerCfg, apiKey, pipedBody, isStream, translateResponse, metrics, httpClient)
+ 	}
+@@ -754,6 +765,12 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
+ 				fwdErr = exec(w, retryReq)
+ 			} else if providerCfg.IsGeminiNative() {
+ 				fwdErr = h.forwardGeminiNativeRequest(ctx, w, provider, providerCfg, apiKey, connectionID, pipedBody, isStream, translateResponse, metrics, httpClient)
++			} else if isVertexProvider(provider) {
++				var psd map[string]any
++				if connData != nil {
++					psd = connData.ProviderSpecificData
++				}
++				fwdErr = h.forwardVertexRequest(ctx, w, provider, providerCfg, apiKey, pipedBody, isStream, translateResponse, metrics, httpClient, model, psd)
+ 			} else {
+ 				fwdErr = h.forwardRequest(ctx, w, providerCfg, apiKey, pipedBody, isStream, translateResponse, metrics, httpClient)
+ 			}

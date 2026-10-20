@@ -7,46 +7,46 @@
 #   9router-go :20130 internal (LLM router + embedded Svelte dashboard)
 #
 # WHY SOURCE BUILD (do not "simplify" this back to the prebuilt release binary):
-# the local patches under patches/ are not in upstream. 0001+0002 fix the
-# antigravity OAuth 401 refresh loop, 0003 carries tool_call ids into the
-# Gemini-native translator, 0004 ports the Vertex AI forwarding lane (without
-# it every vertex model — gemini-3.1-pro-preview included — gets Google's HTML
-# "404: The requested URL /v1 was not found" because the catalog shipped the
-# provider with no executor and the generic forwarder POSTed the bare /v1),
-# 0005 stops the per-chunk "empty envelope response" warning spam on native
-# Gemini/Vertex streams, 0006 makes RTK report no-op compressions as no-ops
-# and byte-truncates huge line-poor tool outputs (the saved_est=0 on 90k-token
-# payloads), 0007 validates thought signatures before sending so a corrupted
-# or stale one is replaced with the known-accepted default upfront instead of
-# paying Google's 400 + reactive re-send, 0008 enforces the Gemini role
+# the local patches under patches/ are not in upstream. 0001 breaks the
+# reactive-401 OAuth refresh loop (atomic json_set persist that checks
+# RowsAffected, plus an in-memory fresh-token hand-off so a lost persist cannot
+# feed the dead token to the next request), 0002 carries tool_call ids into
+# functionCall/functionResponse and repairs id-less pairs, 0003 stops the
+# per-chunk "empty envelope response" warning spam on native Gemini/Vertex
+# streams, 0004 validates thought signatures before sending so a corrupted or
+# stale one is replaced with the known-accepted default upfront instead of
+# paying Google's 400 + reactive re-send, 0005 enforces the Gemini role
 # contract (contents carry only user/model; system text hoisted into
-# systemInstruction) and wires HTTP/2 dead-connection probing
-# (ReadIdleTimeout=2m) so a silently-dead connection fails fast into the
-# retry chain instead of hanging into an unhelpful 502 on heavy prompts,
-# 0009 keeps the vertex body post-process surgical: the old struct-based
-# rewrite dropped the role on every content (400 "Please use a valid role:
-# user, model.") and every other top-level key (tools, systemInstruction,
-# generationConfig) from the request, 0010 re-establishes the
-# terminal-user guarantee on the final vertex wire body (Gemini/Vertex
-# reject a contents array ending with a model turn) and dumps every vertex
-# 400 payload to /tmp for post-mortem, 0013 adds a CORS middleware
+# systemInstruction), answers a terminal model turn, and wires HTTP/2
+# dead-connection probing (ReadIdleTimeout=2m) so a silently-dead connection
+# fails fast into the retry chain instead of hanging into an unhelpful 502 on
+# heavy prompts, 0006 makes RTK report no-op compressions as no-ops and
+# byte-truncates huge line-poor tool outputs (the saved_est=0 on 90k-token
+# payloads), 0007 ports the Vertex AI forwarding lane (without it every vertex
+# model — gemini-3.1-pro-preview included — gets Google's HTML
+# "404: The requested URL /v1 was not found" because the catalog ships the
+# provider with no executor and the generic forwarder POSTs the bare /v1; the
+# body post-process keeps the role and every top-level key, since the old
+# struct rewrite dropped both), 0008 adds a GEMINI_STREAM_DEBUG wire capture,
+# 0009 adds the REASONING_FIELD selector, 0010 adds a CORS middleware
 # (internal/middleware.CORS): the gateway previously emitted no CORS headers
 # and chi answered preflight OPTIONS /v1/messages with 405, so every
 # browser-based client (Claude for Office webview, web apps) died with a bare
 # "Failed to fetch" while curl/SDK clients worked fine.
+#
 # These are git-format diffs against the pinned upstream SHA, so the router
-# must be compiled here. The v1.9.9 prebuilt release binary on GitHub contains
-# none of them. A prebuilt download was tried on 2026-09-29 (commits 4a44423 /
+# must be compiled here. The prebuilt release binaries on GitHub contain none
+# of them. A prebuilt download was tried on 2026-09-29 (commits 4a44423 /
 # 4b930e4) and shipped the 401 loop straight back into production.
 #
 # That download path also forced a Debian base (the release binary links glibc).
 # Building from source with CGO_ENABLED=0 keeps the alpine runtime.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Pinned upstream commit = tag v1.9.9 (2026-10-05, f52294d8). Full 40-char SHA,
+# Pinned upstream commit = tag v1.9.14 (2026-10-20, 6e51890). Full 40-char SHA,
 # not a branch — the build is reproducible. Bump to upgrade, then re-verify the
 # patches still apply (the src stage fails the build if one no longer does).
-ARG ROUTER_SHA=f52294d836e0dc92bbe7aaf18143faa67288b7f4
+ARG ROUTER_SHA=6e518905832b6ab48d04b6fd146c2def3d481012
 
 # ── Fetch upstream source once, at the pinned commit, and apply local patches ─
 FROM alpine:3.21 AS src
@@ -60,34 +60,37 @@ RUN apk add --no-cache curl tar patch \
  && tar -xzf /tmp/src.tgz --strip-components=1 -C /src \
  && rm /tmp/src.tgz \
  && cd /src \
- && for p in /patches/*.patch; do echo "[patch] applying $(basename "$p")"; patch -p1 < "$p"; done \
+ && for p in /patches/*.patch; do echo "[patch] applying $(basename "$p")"; patch -p1 --no-backup-if-mismatch < "$p"; done \
  && grep -q "persistOAuthRefresh" internal/handlers/chat/gemini_handler.go \
  && grep -q "rememberFreshToken" internal/handlers/chat/oauth_freshtoken.go \
- && grep -q "isKiroApiKeyAuth" internal/handlers/chat/gemini_handler.go \
- && grep -q "json_extract(data, '\$.apiKey') = json_extract(data, '\$.accessToken')" internal/handlers/chat/gemini_handler.go \
  && grep -q "upstream 401 before reactive refresh" internal/handlers/chat/fallback.go \
  && grep -q "repairGeminiToolIDs" internal/translator/gemini.go \
- && grep -q "stripThoughtSig" internal/translator/gemini.go \
+ && grep -q "validThoughtSignature" internal/translator/gemini.go \
+ && grep -q "NormalizeGeminiRequest" internal/translator/gemini.go \
+ && grep -q "EnsureGeminiTerminalUserTurn" internal/translator/gemini.go \
+ && grep -q "ApplyHTTP2Keepalive" internal/constants/transport.go \
+ && grep -q "truncateBytes" internal/tokensaver/compress.go \
+ && grep -q "byte-truncation" internal/tokensaver/rtk.go \
  && grep -q "isVertexProvider" internal/handlers/chat/fallback.go \
  && grep -q "publishers/google/models" internal/proxy/vertex.go \
  && grep -q "postProcessVertexBody" internal/proxy/vertex.go \
- && ! grep -q "empty envelope response" internal/translator/antigravity.go \
- && grep -q "truncateBytes" internal/tokensaver/compress.go \
- && grep -q "validThoughtSignature" internal/translator/gemini.go \
- && grep -q "NormalizeGeminiRequest" internal/translator/gemini.go \
- && grep -q "ApplyHTTP2Keepalive" internal/constants/transport.go \
- && grep -q "vertexPostProcessContents" internal/proxy/vertex.go \
- && grep -q "EnsureGeminiTerminalUserTurn" internal/translator/gemini.go \
  && grep -q "GEMINI_STREAM_DEBUG" internal/handlers/chat/gemini_stream_debug.go \
  && grep -q "applyStreamReasoningField" internal/translator/reasoning_field.go \
  && grep -q "corsPreflightMaxAge" internal/middleware/cors.go \
  && grep -q "middleware.CORS" internal/app/handlers.go \
+ && ! grep -q "empty envelope response" internal/translator/antigravity.go \
  && echo "[patch] all fix markers present"
 
 # ── Build the dashboard SPA (bun + Vite) ─────────────────────────────────────
 # web/dist/ is gitignored upstream and consumed via //go:embed dist/*, so the
 # Go stage below MUST receive these built assets before it compiles.
-FROM oven/bun:1-alpine AS web-builder
+#
+# bun is PINNED: upstream's web/bun.lock is lockfileVersion 2, which bun 1.3
+# cannot parse ("UnknownLockfileVersion ... Ignoring lockfile" then
+# "lockfile had changes, but lockfile is frozen"). Upstream CI builds with
+# 1.4.2; the unpinned `oven/bun:1-alpine` tag silently follows the newest 1.x,
+# so a future major could break the frozen install the same way.
+FROM oven/bun:1.4.3-alpine AS web-builder
 WORKDIR /src
 COPY --from=src /src/ ./
 WORKDIR /src/web

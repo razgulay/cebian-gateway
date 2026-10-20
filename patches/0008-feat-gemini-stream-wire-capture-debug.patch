@@ -1,62 +1,3 @@
-From dfb829bc8757183b48c479af77900afb710864bd Mon Sep 17 00:00:00 2001
-From: razgulay <bantran09@outlook.com>
-Date: Mon, 5 Oct 2026 21:46:36 +0700
-Subject: [PATCH 11/11] =?UTF-8?q?feat(debug):=20GEMINI=5FSTREAM=5FDEBUG=20?=
- =?UTF-8?q?=E2=80=94=20raw=20wire=20capture=20for=20the=20gemini-native=20?=
- =?UTF-8?q?lanes?=
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-Tool-call text leakage reports on ag/gemini-3.8-flash (analysis tokens
-surfacing in the visible content channel instead of a thought block)
-cannot be fixed blind: the Go classifier matches the upstream JS exactly
-(thought===true -> reasoning, else content, snake_case signatures
-covered), so if 3.8 emits its analysis without the thought flag, the
-reference implementation leaks identically — the containment has to be
-model-specific and evidence-based.
-
-GEMINI_STREAM_DEBUG=<dir> turns on per-request capture: every raw
-upstream SSE chunk and its translated OpenAI frame land in
-<dir>/gemini-stream-*.log as RAW/OUT pairs, with capped previews on the
-debug log for log-only deployments. Nil-receiver no-op when unset.
----
- internal/handlers/chat/gemini_handler.go      |  6 ++
- internal/handlers/chat/gemini_stream_debug.go | 81 +++++++++++++++++++
- 2 files changed, 87 insertions(+)
- create mode 100644 internal/handlers/chat/gemini_stream_debug.go
-
-diff --git a/internal/handlers/chat/gemini_handler.go b/internal/handlers/chat/gemini_handler.go
-index 5270a41..d929018 100644
---- a/internal/handlers/chat/gemini_handler.go
-+++ b/internal/handlers/chat/gemini_handler.go
-@@ -497,6 +497,10 @@ func (h *ChatHandler) handleGeminiStream(ctx context.Context, w http.ResponseWri
- 		translator.ClearStreamState(sessionKey)
- 	}()
- 
-+	// GEMINI_STREAM_DEBUG wire capture — nil (and free) unless the env is set.
-+	capture := startGeminiStreamCapture()
-+	defer capture.close()
-+
- 	var totalChunks int
- 	var totalBytesWritten int
- 	err := proxy.ScanStream(upstream, func(chunk []byte) {
-@@ -507,6 +511,7 @@ func (h *ChatHandler) handleGeminiStream(ctx context.Context, w http.ResponseWri
- 
- 		// Unwrap antigravity envelope if present (SSE chunks may be wrapped as {"response": {...}})
- 		unwrapped := translator.UnwrapAntigravityResponse(chunk)
-+		capture.raw(unwrapped)
- 
- 		// Translate each Gemini SSE chunk to OpenAI SSE chunk
- 		openaiChunk, err := translator.TranslateGeminiChunkToOpenAI(unwrapped, geminiState)
-@@ -517,6 +522,7 @@ func (h *ChatHandler) handleGeminiStream(ctx context.Context, w http.ResponseWri
- 		if openaiChunk == nil {
- 			return
- 		}
-+		capture.out(openaiChunk)
- 
- 		totalChunks++
- 		if metrics.TTFT == 0 {
 diff --git a/internal/handlers/chat/gemini_stream_debug.go b/internal/handlers/chat/gemini_stream_debug.go
 new file mode 100644
 index 0000000..3ad7fce
@@ -144,3 +85,34 @@ index 0000000..3ad7fce
 +	}
 +	return string(b)
 +}
+diff --git a/internal/handlers/chat/gemini_handler.go b/internal/handlers/chat/gemini_handler.go
+index b375461..fdf159f 100644
+--- a/internal/handlers/chat/gemini_handler.go
++++ b/internal/handlers/chat/gemini_handler.go
+@@ -503,6 +560,10 @@ func (h *ChatHandler) handleGeminiStream(ctx context.Context, w http.ResponseWri
+ 		translator.ClearStreamState(sessionKey)
+ 	}()
+ 
++	// GEMINI_STREAM_DEBUG wire capture — nil (and free) unless the env is set.
++	capture := startGeminiStreamCapture()
++	defer capture.close()
++
+ 	var totalChunks int
+ 	var totalBytesWritten int
+ 	err := proxy.ScanStream(upstream, func(chunk []byte) {
+@@ -513,6 +574,7 @@ func (h *ChatHandler) handleGeminiStream(ctx context.Context, w http.ResponseWri
+ 
+ 		// Unwrap antigravity envelope if present (SSE chunks may be wrapped as {"response": {...}})
+ 		unwrapped := translator.UnwrapAntigravityResponse(chunk)
++		capture.raw(unwrapped)
+ 
+ 		// Translate each Gemini SSE chunk to OpenAI SSE chunk
+ 		openaiChunk, err := translator.TranslateGeminiChunkToOpenAI(unwrapped, geminiState)
+@@ -523,6 +585,7 @@ func (h *ChatHandler) handleGeminiStream(ctx context.Context, w http.ResponseWri
+ 		if openaiChunk == nil {
+ 			return
+ 		}
++		capture.out(openaiChunk)
+ 
+ 		totalChunks++
+ 		if metrics.TTFT == 0 {
