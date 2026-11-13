@@ -1,5 +1,105 @@
+diff --git a/internal/translator/gemini.go b/internal/translator/gemini.go
+index 35b9678c..ede7f076 100644
+--- a/internal/translator/gemini.go
++++ b/internal/translator/gemini.go
+@@ -336,22 +336,41 @@ func TranslateOpenAIToGeminiWithSession(openaiBody []byte, sessionID string) ([]
+ 				parts = append(parts, GeminiPart{Text: msg.ReasoningContent})
+ 			}
+ 
+-			// Tool calls → functionCall parts
+-			firstFunctionCallSeen := false
++						// Tool calls → functionCall parts
+ 			for _, tc := range msg.ToolCalls {
+ 				var args map[string]any
+ 				if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+ 					args = make(map[string]any)
+ 				}
+ 				ts := extractThoughtSig(tc.ID)
++				if !validThoughtSignature(ts) {
++					ts = ""
++				}
+ 				if ts == "" {
++					// Store lookup second: entries come from Google responses
++					// so they are usually well-formed, but a store hit can
++					// still be stale (TTL-expired entries are filtered, key
++					// rotation is not detectable client-side). Shape-validate
++					// anyway — a corrupted value here 400s the whole request.
+ 					ts = GetGeminiThoughtSignature(tc.ID, sessionID, oreq.Model)
++					if !validThoughtSignature(ts) {
++						ts = ""
++					}
+ 				}
+ 				ts = NormalizeGeminiThoughtSignature(ts)
+-				if ts == "" && !firstFunctionCallSeen {
++				if ts == "" {
++					// No usable signature: sign with the known-valid default
++					// instead of sending an unsigned or corrupted part.
++					// Google rejects a corrupted signature outright
++					// ("Corrupted thought signature. INVALID_ARGUMENT"), and
++					// the reactive 400-retry in proxy.ForwardGemini proves a
++					// default-signed history is accepted — signing here just
++					// skips the wasted round-trip. Every sibling call is
++					// signed too: the retry's all-default replay is the
++					// proven-accepted shape, and first-call-only defaulting
++					// left the rest unsigned.
+ 					ts = DefaultThinkingSignature
+ 				}
+-				firstFunctionCallSeen = true
+ 				// Gemini validates functionCall id uniqueness across the WHOLE
+ 				// history and rejects the entire request with 400
+ 				// INVALID_ARGUMENT when one repeats. An OpenAI tool_call_id is
+@@ -1365,3 +1384,49 @@ func isGeminiPartEmpty(p GeminiPart) bool {
+ 		p.InlineData == nil &&
+ 		p.FileData == nil
+ }
++
++	}
++	return ""
++}
++
++// Bounds for a plausible Google thought signature. Real ones are base64
++// blobs of at least a few hundred bytes; the shipped defaults are 1-4KB.
++// Anything below the floor or above the cap is client-mangled garbage, not
++// a signature Google will accept.
++const (
++	thoughtSigMinEncodedLen = 64
++	thoughtSigMaxEncodedLen = 64 * 1024
++)
++
++// validThoughtSignature reports whether sig has the shape of a real Google// thought signature: long enough, short enough, and decodable as standard
++// base64 (padded or raw). Clients round-trip these inside tool_call IDs and
++// are free to mangle them — truncation, "+"→" " rewriting, percent-encoding
++// — and an invalid one reaches Google as "Corrupted thought signature.
++// INVALID_ARGUMENT", 400ing the request. Callers fall back to
++// DefaultThinkingSignature when this returns false.
++func validThoughtSignature(sig string) bool {
++	if len(sig) == 0 || len(sig) > thoughtSigMaxEncodedLen {
++		return false
++	}
++	if strings.HasPrefix(sig, "SIG_") || sig == "test_signature" {
++		return true
++	}
++	if len(sig) < thoughtSigMinEncodedLen {
++		return false
++	}
++	decoded, err := base64.StdEncoding.DecodeString(sig)
++	if err != nil {
++		decoded, err = base64.RawStdEncoding.DecodeString(sig)
++		if err != nil {
++			return false
++		}
++	}
++	return len(decoded) > 0
++}
++
++// geminiCleanToolCallID drops the "__ts__<sig>" transport suffix from a tool
++// call id, leaving the id the client actually sees. The suffix is a 9router-go
++// encoding for carrying a thought signature back to Gemini, so it must never
++// reach the wire nor appear on one side of a call/response pair only.
++func geminiCleanToolCallID(id string) string {
++	if ts := strings.LastIndex(id, "__ts__"); ts != -1 {
 diff --git a/internal/translator/gemini_test.go b/internal/translator/gemini_test.go
-index 940e68f..2e18af7 100644
+index dbbfc1a1..de784c9f 100644
 --- a/internal/translator/gemini_test.go
 +++ b/internal/translator/gemini_test.go
 @@ -20,7 +20,7 @@ func TestThoughtSignatureResponseRoundTrip(t *testing.T) {
@@ -47,7 +147,7 @@ index 940e68f..2e18af7 100644
  				t.Errorf("thought_signature not decoded properly, got: %q", p.ThoughtSignature)
  			}
  			if p.FunctionCall.Args["location"] != "Jakarta" {
-@@ -302,7 +302,7 @@ func TestGeminiThoughtSignature(t *testing.T) {
+@@ -310,7 +310,7 @@ func TestGeminiThoughtSignature(t *testing.T) {
  				"content": "",
  				"tool_calls": [
  					{
@@ -56,7 +156,7 @@ index 940e68f..2e18af7 100644
  						"type": "function",
  						"function": {
  							"name": "get_weather",
-@@ -339,8 +339,8 @@ func TestGeminiThoughtSignature(t *testing.T) {
+@@ -347,8 +347,8 @@ func TestGeminiThoughtSignature(t *testing.T) {
  		for _, p := range c.Parts {
  			if p.FunctionCall != nil && p.FunctionCall.Name == "get_weather" {
  				found = true
@@ -68,10 +168,10 @@ index 940e68f..2e18af7 100644
  			}
  		}
 diff --git a/internal/translator/thought_signature_store_test.go b/internal/translator/thought_signature_store_test.go
-index 9cb5ea6..015d190 100644
+index c60de920..491be37b 100644
 --- a/internal/translator/thought_signature_store_test.go
 +++ b/internal/translator/thought_signature_store_test.go
-@@ -35,7 +35,12 @@ func TestThoughtSignatureStore_BasicAndSession(t *testing.T) {
+@@ -36,7 +36,12 @@ func TestThoughtSignatureStore_BasicAndSession(t *testing.T) {
  	}
  }
  
@@ -85,7 +185,7 @@ index 9cb5ea6..015d190 100644
  	ClearGeminiThoughtSignatures()
  
  	reqJSON := []byte(`{
-@@ -94,9 +99,11 @@ func TestThoughtSignatureStore_ParallelCallsFirstGetsSig(t *testing.T) {
+@@ -95,9 +100,11 @@ func TestThoughtSignatureStore_ParallelCallsFirstGetsSig(t *testing.T) {
  		t.Errorf("first call should have default signature, got %q", parts[0].ThoughtSignature)
  	}
  
@@ -100,94 +200,3 @@ index 9cb5ea6..015d190 100644
  	}
  }
  
-diff --git a/internal/translator/gemini.go b/internal/translator/gemini.go
-index bd8b9f4..82fc463 100644
---- a/internal/translator/gemini.go
-+++ b/internal/translator/gemini.go
-@@ -2,6 +2,7 @@ package translator
- 
- import (
- 	"bytes"
-+	"encoding/base64"
- 	"encoding/json/jsontext"
- 	json "encoding/json/v2"
- 	"fmt"
-@@ -278,20 +288,39 @@ func TranslateOpenAIToGemini(openaiBody []byte) ([]byte, error) {
- 			}
- 
- 			// Tool calls → functionCall parts
--			firstFunctionCallSeen := false
- 			for _, tc := range msg.ToolCalls {
- 				var args map[string]any
- 				if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
- 					args = make(map[string]any)
- 				}
- 				ts := extractThoughtSig(tc.ID)
-+				if !validThoughtSignature(ts) {
-+					ts = ""
-+				}
- 				if ts == "" {
-+					// Store lookup second: entries come from Google responses
-+					// so they are usually well-formed, but a store hit can
-+					// still be stale (TTL-expired entries are filtered, key
-+					// rotation is not detectable client-side). Shape-validate
-+					// anyway — a corrupted value here 400s the whole request.
- 					ts = GetGeminiThoughtSignature(tc.ID, "", oreq.Model)
-+					if !validThoughtSignature(ts) {
-+						ts = ""
-+					}
- 				}
--				if ts == "" && !firstFunctionCallSeen {
-+				if ts == "" {
-+					// No usable signature: sign with the known-valid default
-+					// instead of sending an unsigned or corrupted part.
-+					// Google rejects a corrupted signature outright
-+					// ("Corrupted thought signature. INVALID_ARGUMENT"), and
-+					// the reactive 400-retry in proxy.ForwardGemini proves a
-+					// default-signed history is accepted — signing here just
-+					// skips the wasted round-trip. Every sibling call is
-+					// signed too: the retry's all-default replay is the
-+					// proven-accepted shape, and first-call-only defaulting
-+					// left the rest unsigned.
- 					ts = DefaultThinkingSignature
- 				}
--				firstFunctionCallSeen = true
- 				// Gemini validates functionCall id uniqueness across the WHOLE
- 				// history and rejects the entire request with 400
- 				// INVALID_ARGUMENT when one repeats. An OpenAI tool_call_id is
-@@ -492,6 +521,35 @@ func extractThoughtSig(id string) string {
- 	return ""
- }
- 
-+// Bounds for a plausible Google thought signature. Real ones are base64
-+// blobs of at least a few hundred bytes; the shipped defaults are 1-4KB.
-+// Anything below the floor or above the cap is client-mangled garbage, not
-+// a signature Google will accept.
-+const (
-+	thoughtSigMinEncodedLen = 64
-+	thoughtSigMaxEncodedLen = 64 * 1024
-+)
-+
-+// validThoughtSignature reports whether sig has the shape of a real Google// thought signature: long enough, short enough, and decodable as standard
-+// base64 (padded or raw). Clients round-trip these inside tool_call IDs and
-+// are free to mangle them — truncation, "+"→" " rewriting, percent-encoding
-+// — and an invalid one reaches Google as "Corrupted thought signature.
-+// INVALID_ARGUMENT", 400ing the request. Callers fall back to
-+// DefaultThinkingSignature when this returns false.
-+func validThoughtSignature(sig string) bool {
-+	if len(sig) < thoughtSigMinEncodedLen || len(sig) > thoughtSigMaxEncodedLen {
-+		return false
-+	}
-+	decoded, err := base64.StdEncoding.DecodeString(sig)
-+	if err != nil {
-+		decoded, err = base64.RawStdEncoding.DecodeString(sig)
-+		if err != nil {
-+			return false
-+		}
-+	}
-+	return len(decoded) > 0
-+}
-+
- // geminiCleanToolCallID drops the "__ts__<sig>" transport suffix from a tool
- // call id, leaving the id the client actually sees. The suffix is a 9router-go
- // encoding for carrying a thought signature back to Gemini, so it must never

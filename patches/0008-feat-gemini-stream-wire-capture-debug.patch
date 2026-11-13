@@ -1,6 +1,37 @@
+diff --git a/internal/handlers/chat/gemini_handler.go b/internal/handlers/chat/gemini_handler.go
+index 0d390953..71fa92e2 100644
+--- a/internal/handlers/chat/gemini_handler.go
++++ b/internal/handlers/chat/gemini_handler.go
+@@ -654,6 +654,10 @@ func (h *ChatHandler) handleGeminiStream(ctx context.Context, w http.ResponseWri
+ 		translator.ClearStreamState(sessionKey)
+ 	}()
+ 
++	// GEMINI_STREAM_DEBUG wire capture — nil (and free) unless the env is set.
++	capture := startGeminiStreamCapture()
++	defer capture.close()
++
+ 	var totalChunks int
+ 	var totalBytesWritten int
+ 	err := proxy.ScanStream(upstream, func(chunk []byte) {
+@@ -664,6 +668,7 @@ func (h *ChatHandler) handleGeminiStream(ctx context.Context, w http.ResponseWri
+ 
+ 		// Unwrap antigravity envelope if present (SSE chunks may be wrapped as {"response": {...}})
+ 		unwrapped := translator.UnwrapAntigravityResponse(chunk)
++		capture.raw(unwrapped)
+ 
+ 		// Translate each Gemini SSE chunk to OpenAI SSE chunk
+ 		openaiChunk, err := translator.TranslateGeminiChunkToOpenAI(unwrapped, geminiState)
+@@ -674,6 +679,7 @@ func (h *ChatHandler) handleGeminiStream(ctx context.Context, w http.ResponseWri
+ 		if openaiChunk == nil {
+ 			return
+ 		}
++		capture.out(openaiChunk)
+ 
+ 		totalChunks++
+ 		if metrics.TTFT == 0 {
 diff --git a/internal/handlers/chat/gemini_stream_debug.go b/internal/handlers/chat/gemini_stream_debug.go
 new file mode 100644
-index 0000000..3ad7fce
+index 00000000..3ad7fce1
 --- /dev/null
 +++ b/internal/handlers/chat/gemini_stream_debug.go
 @@ -0,0 +1,81 @@
@@ -85,34 +116,3 @@ index 0000000..3ad7fce
 +	}
 +	return string(b)
 +}
-diff --git a/internal/handlers/chat/gemini_handler.go b/internal/handlers/chat/gemini_handler.go
-index b375461..fdf159f 100644
---- a/internal/handlers/chat/gemini_handler.go
-+++ b/internal/handlers/chat/gemini_handler.go
-@@ -503,6 +560,10 @@ func (h *ChatHandler) handleGeminiStream(ctx context.Context, w http.ResponseWri
- 		translator.ClearStreamState(sessionKey)
- 	}()
- 
-+	// GEMINI_STREAM_DEBUG wire capture — nil (and free) unless the env is set.
-+	capture := startGeminiStreamCapture()
-+	defer capture.close()
-+
- 	var totalChunks int
- 	var totalBytesWritten int
- 	err := proxy.ScanStream(upstream, func(chunk []byte) {
-@@ -513,6 +574,7 @@ func (h *ChatHandler) handleGeminiStream(ctx context.Context, w http.ResponseWri
- 
- 		// Unwrap antigravity envelope if present (SSE chunks may be wrapped as {"response": {...}})
- 		unwrapped := translator.UnwrapAntigravityResponse(chunk)
-+		capture.raw(unwrapped)
- 
- 		// Translate each Gemini SSE chunk to OpenAI SSE chunk
- 		openaiChunk, err := translator.TranslateGeminiChunkToOpenAI(unwrapped, geminiState)
-@@ -523,6 +585,7 @@ func (h *ChatHandler) handleGeminiStream(ctx context.Context, w http.ResponseWri
- 		if openaiChunk == nil {
- 			return
- 		}
-+		capture.out(openaiChunk)
- 
- 		totalChunks++
- 		if metrics.TTFT == 0 {

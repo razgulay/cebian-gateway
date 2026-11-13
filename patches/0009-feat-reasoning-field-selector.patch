@@ -1,6 +1,38 @@
+diff --git a/internal/translator/gemini.go b/internal/translator/gemini.go
+index 247d2830..c6925186 100644
+--- a/internal/translator/gemini.go
++++ b/internal/translator/gemini.go
+@@ -924,12 +924,14 @@ func TranslateGeminiResponseToOpenAI(geminiBody []byte) ([]byte, *OpenAIUsage, e
+ 		},
+ 	}
+ 
++	// Reasoning goes out under the REASONING_FIELD-selected name(s) — or is
++	// suppressed entirely for clients that render unknown fields as text.
++	msg := resp["choices"].([]map[string]any)[0]["message"].(map[string]any)
++	applyNonStreamReasoningField(msg, reasoningContent)
++
+ 	// Remove empty fields
+-	if reasoningContent == "" {
+-		delete(resp["choices"].([]map[string]any)[0]["message"].(map[string]any), "reasoning_content")
+-	}
+ 	if len(toolCalls) == 0 {
+-		delete(resp["choices"].([]map[string]any)[0]["message"].(map[string]any), "tool_calls")
++		delete(msg, "tool_calls")
+ 	}
+ 
+ 	out, err := json.Marshal(resp, json.Deterministic(true))
+@@ -997,7 +999,7 @@ func TranslateGeminiChunkToOpenAI(chunk []byte, state *GeminiStreamState) ([]byt
+ 					delta["content"] = part.Text
+ 				}
+ 				if part.Text != "" && part.Thought != nil && *part.Thought {
+-					delta["reasoning_content"] = part.Text
++					applyStreamReasoningField(delta, part.Text)
+ 				}
+ 				if part.FunctionCall != nil {
+ 					args, err := json.Marshal(part.FunctionCall.Args, json.Deterministic(true))
 diff --git a/internal/translator/reasoning_field.go b/internal/translator/reasoning_field.go
 new file mode 100644
-index 0000000..6dc5422
+index 00000000..6dc5422a
 --- /dev/null
 +++ b/internal/translator/reasoning_field.go
 @@ -0,0 +1,93 @@
@@ -99,7 +131,7 @@ index 0000000..6dc5422
 +}
 diff --git a/internal/translator/reasoning_field_test.go b/internal/translator/reasoning_field_test.go
 new file mode 100644
-index 0000000..a3ae3bb
+index 00000000..a3ae3bbc
 --- /dev/null
 +++ b/internal/translator/reasoning_field_test.go
 @@ -0,0 +1,113 @@
@@ -216,49 +248,3 @@ index 0000000..a3ae3bb
 +		t.Fatalf("analysis leaked into content: %s", out)
 +	}
 +}
-diff --git a/internal/translator/gemini.go b/internal/translator/gemini.go
-index bd8b9f4..82fc463 100644
---- a/internal/translator/gemini.go
-+++ b/internal/translator/gemini.go
-@@ -667,10 +788,9 @@ func TranslateGeminiResponseToOpenAI(geminiBody []byte) ([]byte, *OpenAIUsage, e
- 		"choices": []map[string]any{{
- 			"index": 0,
- 			"message": map[string]any{
--				"role":              "assistant",
--				"content":           openaiContent,
--				"reasoning_content": reasoningContent,
--				"tool_calls":        toolCalls,
-+				"role":       "assistant",
-+				"content":    openaiContent,
-+				"tool_calls": toolCalls,
- 			},
- 			"finish_reason": claudeStop,
- 		}},
-@@ -684,12 +804,14 @@ func TranslateGeminiResponseToOpenAI(geminiBody []byte) ([]byte, *OpenAIUsage, e
- 		},
- 	}
- 
-+	// Reasoning goes out under the REASONING_FIELD-selected name(s) — or is
-+	// suppressed entirely for clients that render unknown fields as text.
-+	msg := resp["choices"].([]map[string]any)[0]["message"].(map[string]any)
-+	applyNonStreamReasoningField(msg, reasoningContent)
-+
- 	// Remove empty fields
--	if reasoningContent == "" {
--		delete(resp["choices"].([]map[string]any)[0]["message"].(map[string]any), "reasoning_content")
--	}
- 	if len(toolCalls) == 0 {
--		delete(resp["choices"].([]map[string]any)[0]["message"].(map[string]any), "tool_calls")
-+		delete(msg, "tool_calls")
- 	}
- 
- 	out, err := json.Marshal(resp)
-@@ -757,7 +879,7 @@ func TranslateGeminiChunkToOpenAI(chunk []byte, state *GeminiStreamState) ([]byt
- 					delta["content"] = part.Text
- 				}
- 				if part.Text != "" && part.Thought != nil && *part.Thought {
--					delta["reasoning_content"] = part.Text
-+					applyStreamReasoningField(delta, part.Text)
- 				}
- 				if part.FunctionCall != nil {
- 					args, err := json.Marshal(part.FunctionCall.Args)

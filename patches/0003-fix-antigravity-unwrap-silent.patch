@@ -1,6 +1,25 @@
+diff --git a/internal/translator/antigravity.go b/internal/translator/antigravity.go
+index a13863e1..3986f5c8 100644
+--- a/internal/translator/antigravity.go
++++ b/internal/translator/antigravity.go
+@@ -886,8 +886,12 @@ func UnwrapAntigravityResponse(raw []byte) []byte {
+ 		return raw // passthrough on failure
+ 	}
+ 	if len(envelope.Response) == 0 {
+-		log.Warn("translator", "empty envelope response")
+-		return raw // passthrough on failure
++		// No "response" key is NOT a failure: native Gemini / Vertex AI
++		// payloads ({"candidates": [...], ...}) parse fine and leave the
++		// field nil. handleGeminiStream runs this on EVERY SSE chunk, and
++		// even antigravity streaming events arrive unwrapped, so a warn here
++		// fires once per chunk for the whole stream. Pass through silently.
++		return raw
+ 	}
+ 	return []byte(envelope.Response)
+ }
 diff --git a/internal/translator/antigravity_unwrap_test.go b/internal/translator/antigravity_unwrap_test.go
 new file mode 100644
-index 0000000..d8cd0fa
+index 00000000..d8cd0fa2
 --- /dev/null
 +++ b/internal/translator/antigravity_unwrap_test.go
 @@ -0,0 +1,43 @@
@@ -47,22 +66,3 @@ index 0000000..d8cd0fa
 +		t.Fatalf("invalid JSON passthrough altered: %s", got)
 +	}
 +}
-diff --git a/internal/translator/antigravity.go b/internal/translator/antigravity.go
-index ee33ac1..623feab 100644
---- a/internal/translator/antigravity.go
-+++ b/internal/translator/antigravity.go
-@@ -755,8 +758,12 @@ func UnwrapAntigravityResponse(raw []byte) []byte {
- 		return raw // passthrough on failure
- 	}
- 	if len(envelope.Response) == 0 {
--		log.Warn("translator", "empty envelope response")
--		return raw // passthrough on failure
-+		// No "response" key is NOT a failure: native Gemini / Vertex AI
-+		// payloads ({"candidates": [...], ...}) parse fine and leave the
-+		// field nil. handleGeminiStream runs this on EVERY SSE chunk, and
-+		// even antigravity streaming events arrive unwrapped, so a warn here
-+		// fires once per chunk for the whole stream. Pass through silently.
-+		return raw
- 	}
- 	return []byte(envelope.Response)
- }

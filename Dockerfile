@@ -43,10 +43,10 @@
 # Building from source with CGO_ENABLED=0 keeps the alpine runtime.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Pinned upstream commit = tag v1.9.14 (2026-10-20, 6e51890). Full 40-char SHA,
+# Pinned upstream commit = tag v1.9.16 (2026-11-12, 0a1cf78). Full 40-char SHA,
 # not a branch — the build is reproducible. Bump to upgrade, then re-verify the
 # patches still apply (the src stage fails the build if one no longer does).
-ARG ROUTER_SHA=6e518905832b6ab48d04b6fd146c2def3d481012
+ARG ROUTER_SHA=0a1cf7853f7d7e5392c0b790388f13847b3b0c6e
 
 # ── Fetch upstream source once, at the pinned commit, and apply local patches ─
 FROM alpine:3.21 AS src

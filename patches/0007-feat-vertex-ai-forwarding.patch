@@ -1,6 +1,36 @@
+diff --git a/internal/handlers/chat/fallback.go b/internal/handlers/chat/fallback.go
+index 31039bf7..2a237088 100644
+--- a/internal/handlers/chat/fallback.go
++++ b/internal/handlers/chat/fallback.go
+@@ -1135,6 +1135,12 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
+ 		execReq.Release()
+ 	} else if providerCfg.IsGeminiNative() {
+ 		fwdErr = h.forwardGeminiNativeRequest(ctx, w, provider, providerCfg, apiKey, connectionID, pipedBody, isStream, translateResponse, metrics, httpClient)
++	} else if isVertexProvider(provider) {
++		var psd map[string]any
++		if connData != nil {
++			psd = connData.ProviderSpecificData
++		}
++		fwdErr = h.forwardVertexRequest(ctx, w, provider, providerCfg, apiKey, pipedBody, isStream, translateResponse, metrics, httpClient, model, psd)
+ 	} else {
+ 		fwdErr = h.forwardRequest(ctx, w, providerCfg, apiKey, pipedBody, isStream, translateResponse, metrics, httpClient, provider, upstreamClaude, claudeNative)
+ 	}
+@@ -1192,6 +1198,12 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
+ 				retryReq.Release()
+ 			} else if providerCfg.IsGeminiNative() {
+ 				fwdErr = h.forwardGeminiNativeRequest(ctx, w, provider, providerCfg, apiKey, connectionID, pipedBody, isStream, translateResponse, metrics, httpClient)
++			} else if isVertexProvider(provider) {
++				var psd map[string]any
++				if connData != nil {
++					psd = connData.ProviderSpecificData
++				}
++				fwdErr = h.forwardVertexRequest(ctx, w, provider, providerCfg, apiKey, pipedBody, isStream, translateResponse, metrics, httpClient, model, psd)
+ 			} else {
+ 				fwdErr = h.forwardRequest(ctx, w, providerCfg, apiKey, pipedBody, isStream, translateResponse, metrics, httpClient, provider, upstreamClaude, claudeNative)
+ 			}
 diff --git a/internal/handlers/chat/vertex_handler.go b/internal/handlers/chat/vertex_handler.go
 new file mode 100644
-index 0000000..c425f0f
+index 00000000..9e743f59
 --- /dev/null
 +++ b/internal/handlers/chat/vertex_handler.go
 @@ -0,0 +1,110 @@
@@ -112,11 +142,35 @@ index 0000000..c425f0f
 +		cfg.NoAuth = true
 +	}
 +	log.Debug("vertex", "partner request", "url", finalURL)
-+	return h.forwardRequest(ctx, w, &cfg, key, body, isStream, translateResponse, metrics, httpClient)
++	return h.forwardRequest(ctx, w, &cfg, key, body, isStream, translateResponse, metrics, httpClient, "vertex-partner", false, false)
 +}
+diff --git a/internal/providers/providers.go b/internal/providers/providers.go
+index 1f3cf3eb..155af8c4 100644
+--- a/internal/providers/providers.go
++++ b/internal/providers/providers.go
+@@ -1239,13 +1239,17 @@ var KnownProviders = map[string]ProviderConfig{
+ 		SearchURL:    "https://api.z.ai/api/mcp/web_search",
+ 		SearchMethod: "POST",
+ 	},
++	// Host root only — path building lives in internal/proxy/vertex.go, which
++	// appends /v1/publishers/... (express keys) or /v1/projects/... (OAuth).
++	// The old /v1 suffix here made the generic forwarder POST the bare
++	// version segment and collect Google's HTML 404 for every model.
+ 	"vertex": {
+-		BaseURL:    "https://aiplatform.googleapis.com/v1",
++		BaseURL:    "https://aiplatform.googleapis.com",
+ 		AuthHeader: "Authorization",
+ 		AuthScheme: "bearer",
+ 	},
+ 	"vertex-partner": {
+-		BaseURL:    "https://aiplatform.googleapis.com/v1",
++		BaseURL:    "https://aiplatform.googleapis.com",
+ 		AuthHeader: "Authorization",
+ 		AuthScheme: "bearer",
+ 	},
 diff --git a/internal/proxy/vertex.go b/internal/proxy/vertex.go
 new file mode 100644
-index 0000000..29f2234
+index 00000000..29f22348
 --- /dev/null
 +++ b/internal/proxy/vertex.go
 @@ -0,0 +1,624 @@
@@ -746,7 +800,7 @@ index 0000000..29f2234
 +}
 diff --git a/internal/proxy/vertex_test.go b/internal/proxy/vertex_test.go
 new file mode 100644
-index 0000000..d6403f5
+index 00000000..d6403f5a
 --- /dev/null
 +++ b/internal/proxy/vertex_test.go
 @@ -0,0 +1,274 @@
@@ -1026,7 +1080,7 @@ index 0000000..d6403f5
 +}
 diff --git a/internal/proxy/vertex_testhelpers_test.go b/internal/proxy/vertex_testhelpers_test.go
 new file mode 100644
-index 0000000..86186a1
+index 00000000..86186a1e
 --- /dev/null
 +++ b/internal/proxy/vertex_testhelpers_test.go
 @@ -0,0 +1,36 @@
@@ -1066,57 +1120,3 @@ index 0000000..86186a1
 +	}
 +	return string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))
 +}
-diff --git a/internal/providers/providers.go b/internal/providers/providers.go
-index 87d601a..593f5af 100644
---- a/internal/providers/providers.go
-+++ b/internal/providers/providers.go
-@@ -979,13 +979,17 @@ var KnownProviders = map[string]ProviderConfig{
- 		AuthHeader: "Authorization",
- 		AuthScheme: "bearer",
- 	},
-+	// Host root only — path building lives in internal/proxy/vertex.go, which
-+	// appends /v1/publishers/... (express keys) or /v1/projects/... (OAuth).
-+	// The old /v1 suffix here made the generic forwarder POST the bare
-+	// version segment and collect Google's HTML 404 for every model.
- 	"vertex": {
--		BaseURL:    "https://aiplatform.googleapis.com/v1",
-+		BaseURL:    "https://aiplatform.googleapis.com",
- 		AuthHeader: "Authorization",
- 		AuthScheme: "bearer",
- 	},
- 	"vertex-partner": {
--		BaseURL:    "https://aiplatform.googleapis.com/v1",
-+		BaseURL:    "https://aiplatform.googleapis.com",
- 		AuthHeader: "Authorization",
- 		AuthScheme: "bearer",
- 	},
-diff --git a/internal/handlers/chat/fallback.go b/internal/handlers/chat/fallback.go
-index ff0f2a4..c671fd2 100644
---- a/internal/handlers/chat/fallback.go
-+++ b/internal/handlers/chat/fallback.go
-@@ -709,6 +709,12 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
- 		fwdErr = exec(w, execReq)
- 	} else if providerCfg.IsGeminiNative() {
- 		fwdErr = h.forwardGeminiNativeRequest(ctx, w, provider, providerCfg, apiKey, connectionID, pipedBody, isStream, translateResponse, metrics, httpClient)
-+	} else if isVertexProvider(provider) {
-+		var psd map[string]any
-+		if connData != nil {
-+			psd = connData.ProviderSpecificData
-+		}
-+		fwdErr = h.forwardVertexRequest(ctx, w, provider, providerCfg, apiKey, pipedBody, isStream, translateResponse, metrics, httpClient, model, psd)
- 	} else {
- 		fwdErr = h.forwardRequest(ctx, w, providerCfg, apiKey, pipedBody, isStream, translateResponse, metrics, httpClient)
- 	}
-@@ -754,6 +765,12 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
- 				fwdErr = exec(w, retryReq)
- 			} else if providerCfg.IsGeminiNative() {
- 				fwdErr = h.forwardGeminiNativeRequest(ctx, w, provider, providerCfg, apiKey, connectionID, pipedBody, isStream, translateResponse, metrics, httpClient)
-+			} else if isVertexProvider(provider) {
-+				var psd map[string]any
-+				if connData != nil {
-+					psd = connData.ProviderSpecificData
-+				}
-+				fwdErr = h.forwardVertexRequest(ctx, w, provider, providerCfg, apiKey, pipedBody, isStream, translateResponse, metrics, httpClient, model, psd)
- 			} else {
- 				fwdErr = h.forwardRequest(ctx, w, providerCfg, apiKey, pipedBody, isStream, translateResponse, metrics, httpClient)
- 			}

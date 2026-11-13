@@ -1,6 +1,21 @@
+diff --git a/internal/app/handlers.go b/internal/app/handlers.go
+index 4de3acc3..9b246520 100644
+--- a/internal/app/handlers.go
++++ b/internal/app/handlers.go
+@@ -69,6 +69,10 @@ func ProvideTokenSaverConfig(repo *db.Repo, params CLIParams) *handlers.TokenSav
+ func ProvideRouter(repo *db.Repo, ts *handlers.TokenSaverConfig) (*chi.Mux, *chat.ChatHandler) {
+ 	r := chi.NewRouter()
+ 	r.Use(middleware.RequestID)
++	// CORS before auth/routing: preflight OPTIONS must answer 204 here, else
++	// chi's route tree 405s it (only POST/GET are registered on /v1/*) and
++	// every browser client dies at preflight with a bare "Failed to fetch".
++	r.Use(middleware.CORS)
+ 	// Body limits are path-aware: JSON APIs keep the 10MB ceiling, the media
+ 	// endpoints that receive multipart video/audio bodies get their own larger
+ 	// one (middleware.MediaBodyLimitRules). One middleware decides the ceiling
 diff --git a/internal/middleware/cors.go b/internal/middleware/cors.go
 new file mode 100644
-index 0000000..94fa6f6
+index 00000000..94fa6f65
 --- /dev/null
 +++ b/internal/middleware/cors.go
 @@ -0,0 +1,69 @@
@@ -75,7 +90,7 @@ index 0000000..94fa6f6
 +}
 diff --git a/internal/middleware/cors_test.go b/internal/middleware/cors_test.go
 new file mode 100644
-index 0000000..1bbcf31
+index 00000000..1bbcf317
 --- /dev/null
 +++ b/internal/middleware/cors_test.go
 @@ -0,0 +1,131 @@
@@ -210,18 +225,3 @@ index 0000000..1bbcf31
 +		t.Errorf("expected reflected Origin, got %q", got)
 +	}
 +}
-diff --git a/internal/app/handlers.go b/internal/app/handlers.go
-index ed6beea..93b16f3 100644
---- a/internal/app/handlers.go
-+++ b/internal/app/handlers.go
-@@ -61,6 +61,10 @@ func ProvideTokenSaverConfig(repo *db.Repo, params CLIParams) *handlers.TokenSav
- func ProvideRouter(repo *db.Repo, ts *handlers.TokenSaverConfig) *chi.Mux {
- 	r := chi.NewRouter()
- 	r.Use(middleware.RequestID)
-+	// CORS before auth/routing: preflight OPTIONS must answer 204 here, else
-+	// chi's route tree 405s it (only POST/GET are registered on /v1/*) and
-+	// every browser client dies at preflight with a bare "Failed to fetch".
-+	r.Use(middleware.CORS)
- 	// Body limits are path-aware: JSON APIs keep the 10MB ceiling, the media
- 	// endpoints that receive multipart video/audio bodies get their own larger
- 	// one (middleware.MediaBodyLimitRules). One middleware decides the ceiling

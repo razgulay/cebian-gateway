@@ -1,6 +1,174 @@
+diff --git a/internal/tokensaver/compress.go b/internal/tokensaver/compress.go
+index 07bc6fb1..4f4e6597 100644
+--- a/internal/tokensaver/compress.go
++++ b/internal/tokensaver/compress.go
+@@ -24,6 +24,14 @@ const (
+ 	GitLogMaxLines  = 200
+ 	GrepPerFileMax  = 10
+ 	TreeMaxLines    = 200
++
++	// Byte-mode fallback (truncateBytes): payloads that are huge but have too
++	// few lines for line-mode truncation — minified JSON, base64, a web fetch
++	// dumped on one line. A 90k-token tool result that fits in a handful of
++	// lines used to fall through every detector and come back unchanged.
++	ByteTruncMin  = 24 * 1024 // engage only past this size
++	ByteTruncHead = 10 * 1024 // bytes kept from the start
++	ByteTruncTail = 4 * 1024  // bytes kept from the end
+ )
+ 
+ // protectedTools lists the tools whose output must never be rewritten.
+@@ -262,6 +270,19 @@ func CompressMessagesWithConfig(body []byte, cfg RTKConfig) ([]byte, bool) {
+ 
+ 	toolMap, cmdMap := buildToolCallMap(items)
+ 	compressed := false
++	// shrink wraps the compressor with a real-savings check: the detectors
++	// (line caps, MinCompressSize) can legitimately return the input
++	// unchanged — a 300-line-but-small tool output, a grep under the per-file
++	// cap. Marking that as "compressed" shipped RTK logs with saved_est=0 /
++	// saved_pct=0% and paid two re-marshals for nothing.
++	shrink := func(text, command string) string {
++		c := CompressTextWithCommand(text, command, cfg)
++		if len(c) < len(text) {
++			compressed = true
++			return c
++		}
++		return text
++	}
+ 	for _, msg := range items {
+ 		// OpenAI Responses: function_call_output
+ 		if msg["type"] == "function_call_output" {
+@@ -281,15 +302,13 @@ func CompressMessagesWithConfig(body []byte, cfg RTKConfig) ([]byte, bool) {
+ 				continue
+ 			}
+ 			if output, ok := msg["output"].(string); ok && len(output) > MinCompressSize {
+-				msg["output"] = CompressTextWithCommand(output, command, cfg)
+-				compressed = true
++				msg["output"] = shrink(output, command)
+ 			} else if outputArr, ok := msg["output"].([]any); ok {
+ 				for _, part := range outputArr {
+ 					if partMap, ok := part.(map[string]any); ok {
+ 						if t, ok := partMap["type"].(string); ok && (t == "input_text" || t == "text") {
+ 							if text, ok := partMap["text"].(string); ok && len(text) > MinCompressSize {
+-								partMap["text"] = CompressTextWithCommand(text, command, cfg)
+-								compressed = true
++								partMap["text"] = shrink(text, command)
+ 							}
+ 						}
+ 					}
+@@ -316,15 +335,13 @@ func CompressMessagesWithConfig(body []byte, cfg RTKConfig) ([]byte, bool) {
+ 				continue
+ 			}
+ 			if content, ok := msg["content"].(string); ok && len(content) > MinCompressSize {
+-				msg["content"] = CompressTextWithCommand(content, command, cfg)
+-				compressed = true
++				msg["content"] = shrink(content, command)
+ 			} else if contentArr, ok := msg["content"].([]any); ok {
+ 				for _, part := range contentArr {
+ 					if partMap, ok := part.(map[string]any); ok {
+ 						if t, ok := partMap["type"].(string); ok && t == "text" {
+ 							if text, ok := partMap["text"].(string); ok && len(text) > MinCompressSize {
+-								partMap["text"] = CompressTextWithCommand(text, command, cfg)
+-								compressed = true
++								partMap["text"] = shrink(text, command)
+ 							}
+ 						}
+ 					}
+@@ -361,19 +378,16 @@ func CompressMessagesWithConfig(body []byte, cfg RTKConfig) ([]byte, bool) {
+ 				}
+ 
+ 				if text, ok := block["text"].(string); ok && len(text) > MinCompressSize {
+-					block["text"] = CompressTextWithCommand(text, command, cfg)
+-					compressed = true
++					block["text"] = shrink(text, command)
+ 				}
+ 				if content, ok := block["content"].(string); ok && len(content) > MinCompressSize {
+-					block["content"] = CompressTextWithCommand(content, command, cfg)
+-					compressed = true
++					block["content"] = shrink(content, command)
+ 				} else if innerArr, ok := block["content"].([]any); ok {
+ 					for _, innerPart := range innerArr {
+ 						if innerBlock, ok := innerPart.(map[string]any); ok {
+ 							if innerBlock["type"] == "text" {
+ 								if text, ok := innerBlock["text"].(string); ok && len(text) > MinCompressSize {
+-									innerBlock["text"] = CompressTextWithCommand(text, command, cfg)
+-									compressed = true
++									innerBlock["text"] = shrink(text, command)
+ 								}
+ 							}
+ 						}
+@@ -401,6 +415,10 @@ func CompressMessagesWithConfig(body []byte, cfg RTKConfig) ([]byte, bool) {
+ }
+ 
+ // CompressText applies content-aware compression.
++// Returns the input UNCHANGED when no compressor engages — including the
++// trailing-whitespace case. Callers gate on a real size reduction, so a
++// plain trim must never count as compression (it shipped saved_est=0 logs
++// and a pointless body rewrite for 1 byte of whitespace).
+ func CompressText(text string) string {
+ 	if len(text) < MinCompressSize {
+ 		return text
+@@ -419,7 +437,10 @@ func CompressText(text string) string {
+ 	if isTreeOutput(trimmed) {
+ 		return compressTree(trimmed)
+ 	}
+-	return smartTruncate(trimmed)
++	if t := smartTruncate(trimmed); len(t) < len(trimmed) {
++		return t
++	}
++	return text
+ }
+ 
+ func isGitDiff(s string) bool {
+@@ -501,7 +522,10 @@ func smartTruncate(s string) string {
+ 	// `<` is upstream's comparison (open-sse/rtk/filters/smartTruncate.js):
+ 	// a payload of exactly SMART_TRUNCATE_MIN_LINES lines is truncated.
+ 	if len(lines) < SmartTruncMin {
+-		return s
++		// Few lines: line-mode has nothing to cut. A payload can still be
++		// enormous on those few lines, so fall back to byte-mode truncation
++		// instead of returning it unchanged.
++		return truncateBytes(s)
+ 	}
+ 	head := lines[:SmartTruncHead]
+ 	tail := lines[len(lines)-SmartTruncTail:]
+@@ -509,6 +533,34 @@ func smartTruncate(s string) string {
+ 	return strings.Join(append(result, tail...), "\n")
+ }
+ 
++// truncateBytes keeps the head and tail of a byte-heavy, line-poor payload
++// and replaces the middle with a marker. Cuts are backed off to UTF-8 rune
++// boundaries so the kept text stays valid.
++func truncateBytes(s string) string {
++	if len(s) <= ByteTruncMin {
++		return s
++	}
++	headEnd := runeStartIndex(s, ByteTruncHead)
++	tailStart := runeStartIndex(s, len(s)-ByteTruncTail)
++	if tailStart <= headEnd {
++		return s
++	}
++	return s[:headEnd] +
++		"\n... (" + itoa(tailStart-headEnd) + " bytes truncated)\n" +
++		s[tailStart:]
++}
++
++// runeStartIndex returns the largest index <= i that begins a UTF-8 rune.
++func runeStartIndex(s string, i int) int {
++	for i > 0 && i < len(s) && s[i]&0xC0 == 0x80 {
++		i--
++	}
++	if i < 0 {
++		return 0
++	}
++	return i
++}
++
+ func itoa(n int) string {
+ 	return strconv.Itoa(n)
+ }
 diff --git a/internal/tokensaver/compress_noop_test.go b/internal/tokensaver/compress_noop_test.go
 new file mode 100644
-index 0000000..a12bf70
+index 00000000..a12bf708
 --- /dev/null
 +++ b/internal/tokensaver/compress_noop_test.go
 @@ -0,0 +1,128 @@
@@ -132,187 +300,8 @@ index 0000000..a12bf70
 +		t.Error("head/tail runes damaged")
 +	}
 +}
-diff --git a/internal/tokensaver/compress.go b/internal/tokensaver/compress.go
-index 408711b..a33495a 100644
---- a/internal/tokensaver/compress.go
-+++ b/internal/tokensaver/compress.go
-@@ -17,6 +17,14 @@ const (
- 	GitLogMaxLines  = 200
- 	GrepPerFileMax  = 10
- 	TreeMaxLines    = 200
-+
-+	// Byte-mode fallback (truncateBytes): payloads that are huge but have too
-+	// few lines for line-mode truncation — minified JSON, base64, a web fetch
-+	// dumped on one line. A 90k-token tool result that fits in a handful of
-+	// lines used to fall through every detector and come back unchanged.
-+	ByteTruncMin  = 24 * 1024 // engage only past this size
-+	ByteTruncHead = 10 * 1024 // bytes kept from the start
-+	ByteTruncTail = 4 * 1024  // bytes kept from the end
- )
- 
- // CompressMessages compresses tool_result content in LLM request bodies in-place.
-@@ -55,12 +63,24 @@ func CompressMessagesWithConfig(body []byte, cfg RTKConfig) ([]byte, bool) {
- 	}
- 
- 	compressed := false
-+	// shrink wraps the compressor with a real-savings check: the detectors
-+	// (line caps, MinCompressSize) can legitimately return the input
-+	// unchanged — a 300-line-but-small tool output, a grep under the per-file
-+	// cap. Marking that as "compressed" shipped RTK logs with saved_est=0 /
-+	// saved_pct=0% and paid two re-marshals for nothing.
-+	shrink := func(text string) string {
-+		c := CompressTextWithConfig(text, cfg)
-+		if len(c) < len(text) {
-+			compressed = true
-+			return c
-+		}
-+		return text
-+	}
- 	for _, msg := range items {
- 		// OpenAI Responses: function_call_output
- 		if msg["type"] == "function_call_output" {
- 			if output, ok := msg["output"].(string); ok && len(output) > MinCompressSize {
--				msg["output"] = CompressTextWithConfig(output, cfg)
--				compressed = true
-+				msg["output"] = shrink(output)
- 			}
- 			continue
- 		}
-@@ -68,8 +88,7 @@ func CompressMessagesWithConfig(body []byte, cfg RTKConfig) ([]byte, bool) {
- 		// OpenAI tool message
- 		if msg["role"] == "tool" {
- 			if content, ok := msg["content"].(string); ok && len(content) > MinCompressSize {
--				msg["content"] = CompressTextWithConfig(content, cfg)
--				compressed = true
-+				msg["content"] = shrink(content)
- 			}
- 			continue
- 		}
-@@ -86,14 +105,12 @@ func CompressMessagesWithConfig(body []byte, cfg RTKConfig) ([]byte, bool) {
- 			}
- 			if block["type"] == "tool_result" {
- 				if text, ok := block["text"].(string); ok && len(text) > MinCompressSize {
--					block["text"] = CompressTextWithConfig(text, cfg)
--					compressed = true
-+					block["text"] = shrink(text)
- 				}
- 			}
- 			if block["type"] == "text" {
- 				if text, ok := block["text"].(string); ok && len(text) > MinCompressSize {
--					block["text"] = CompressTextWithConfig(text, cfg)
--					compressed = true
-+					block["text"] = shrink(text)
- 				}
- 			}
- 		}
-@@ -117,6 +134,10 @@ func CompressMessagesWithConfig(body []byte, cfg RTKConfig) ([]byte, bool) {
- }
- 
- // CompressText applies content-aware compression.
-+// Returns the input UNCHANGED when no compressor engages — including the
-+// trailing-whitespace case. Callers gate on a real size reduction, so a
-+// plain trim must never count as compression (it shipped saved_est=0 logs
-+// and a pointless body rewrite for 1 byte of whitespace).
- func CompressText(text string) string {
- 	if len(text) < MinCompressSize {
- 		return text
-@@ -135,7 +156,10 @@ func CompressText(text string) string {
- 	if isTreeOutput(trimmed) {
- 		return compressTree(trimmed)
- 	}
--	return smartTruncate(trimmed)
-+	if t := smartTruncate(trimmed); len(t) < len(trimmed) {
-+		return t
-+	}
-+	return text
- }
- 
- func isGitDiff(s string) bool {
-@@ -215,7 +239,10 @@ func compressTree(s string) string {
- func smartTruncate(s string) string {
- 	lines := strings.Split(s, "\n")
- 	if len(lines) <= SmartTruncMin {
--		return s
-+		// Few lines: line-mode has nothing to cut. A payload can still be
-+		// enormous on those few lines, so fall back to byte-mode truncation
-+		// instead of returning it unchanged.
-+		return truncateBytes(s)
- 	}
- 	head := lines[:SmartTruncHead]
- 	tail := lines[len(lines)-SmartTruncTail:]
-@@ -223,6 +250,34 @@ func smartTruncate(s string) string {
- 	return strings.Join(append(result, tail...), "\n")
- }
- 
-+// truncateBytes keeps the head and tail of a byte-heavy, line-poor payload
-+// and replaces the middle with a marker. Cuts are backed off to UTF-8 rune
-+// boundaries so the kept text stays valid.
-+func truncateBytes(s string) string {
-+	if len(s) <= ByteTruncMin {
-+		return s
-+	}
-+	headEnd := runeStartIndex(s, ByteTruncHead)
-+	tailStart := runeStartIndex(s, len(s)-ByteTruncTail)
-+	if tailStart <= headEnd {
-+		return s
-+	}
-+	return s[:headEnd] +
-+		"\n... (" + itoa(tailStart-headEnd) + " bytes truncated)\n" +
-+		s[tailStart:]
-+}
-+
-+// runeStartIndex returns the largest index <= i that begins a UTF-8 rune.
-+func runeStartIndex(s string, i int) int {
-+	for i > 0 && i < len(s) && s[i]&0xC0 == 0x80 {
-+		i--
-+	}
-+	if i < 0 {
-+		return 0
-+	}
-+	return i
-+}
-+
- func itoa(n int) string {
- 	return strconv.Itoa(n)
- }
-diff --git a/internal/tokensaver/rtk.go b/internal/tokensaver/rtk.go
-index db7976f..dea2b23 100644
---- a/internal/tokensaver/rtk.go
-+++ b/internal/tokensaver/rtk.go
-@@ -483,6 +483,15 @@ func CompressTextDetailed(text string, cfg RTKConfig) RTKCompressResult {
- 	if len(lines) > maxLines && len(curr) >= MinCompressSize {
- 		curr = smartTruncateLines(lines, maxLines)
- 		techniques = append(techniques, "smart-truncation")
-+	} else if len(lines) <= maxLines && len(curr) >= ByteTruncMin {
-+		// Line mode had nothing to cut, but a payload can still be enormous on
-+		// those few lines — minified JSON, base64, a one-line web fetch. A
-+		// 90k-token tool result used to fall through every line-based detector
-+		// and come back unchanged; truncate by bytes instead.
-+		if cut := truncateBytes(curr); len(cut) < len(curr) {
-+			curr = cut
-+			techniques = append(techniques, "byte-truncation")
-+		}
- 	}
- 
- 	// 4. Character truncation if still over maxChars
-@@ -496,6 +505,15 @@ func CompressTextDetailed(text string, cfg RTKConfig) RTKCompressResult {
- 		techniques = append(techniques, "char-truncation")
- 	}
- 
-+	// The pipeline must never report a compression that did not happen: a
-+	// trim, a detector that declined, or a "technique" whose output is not
-+	// shorter all look identical to a real saving in the logs otherwise.
-+	if len(curr) >= origLen {
-+		curr = text
-+		techniques = techniques[:0]
-+		techniques = append(techniques, "none")
-+	}
-+
- 	if len(techniques) == 0 {
- 		techniques = append(techniques, "none")
- 	}
 diff --git a/internal/tokensaver/preserve_numbers_test.go b/internal/tokensaver/preserve_numbers_test.go
-index dc8f595..29f1166 100644
+index dc8f5959..29f1166b 100644
 --- a/internal/tokensaver/preserve_numbers_test.go
 +++ b/internal/tokensaver/preserve_numbers_test.go
 @@ -11,7 +11,11 @@ import (
@@ -328,3 +317,39 @@ index dc8f595..29f1166 100644
  	body := []byte(`{
  		"model": "gpt-4o",
  		"temperature": 0.7,
+diff --git a/internal/tokensaver/rtk.go b/internal/tokensaver/rtk.go
+index db86aa91..66a1a685 100644
+--- a/internal/tokensaver/rtk.go
++++ b/internal/tokensaver/rtk.go
+@@ -526,6 +526,15 @@ func CompressTextDetailedWithCommand(text string, command string, cfg RTKConfig)
+ 	if len(lines) >= minLinesThreshold && len(lines) > maxLines && len(curr) >= MinCompressSize {
+ 		curr = smartTruncateLines(lines, maxLines, matchedFilter)
+ 		techniques = append(techniques, "smart-truncation")
++	} else if len(lines) <= maxLines && len(curr) >= ByteTruncMin {
++		// Line mode had nothing to cut, but a payload can still be enormous on
++		// those few lines — minified JSON, base64, a one-line web fetch. A
++		// 90k-token tool result used to fall through every line-based detector
++		// and come back unchanged; truncate by bytes instead.
++		if cut := truncateBytes(curr); len(cut) < len(curr) {
++			curr = cut
++			techniques = append(techniques, "byte-truncation")
++		}
+ 	}
+ 
+ 	// 4. Character truncation if still over maxChars
+@@ -539,6 +548,15 @@ func CompressTextDetailedWithCommand(text string, command string, cfg RTKConfig)
+ 		techniques = append(techniques, "char-truncation")
+ 	}
+ 
++	// The pipeline must never report a compression that did not happen: a
++	// trim, a detector that declined, or a "technique" whose output is not
++	// shorter all look identical to a real saving in the logs otherwise.
++	if len(curr) >= origLen {
++		curr = text
++		techniques = techniques[:0]
++		techniques = append(techniques, "none")
++	}
++
+ 	if len(techniques) == 0 {
+ 		techniques = append(techniques, "none")
+ 	}

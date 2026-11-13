@@ -1,238 +1,5 @@
-diff --git a/internal/translator/gemini_role_contract_test.go b/internal/translator/gemini_role_contract_test.go
-new file mode 100644
-index 0000000..cebf337
---- /dev/null
-+++ b/internal/translator/gemini_role_contract_test.go
-@@ -0,0 +1,112 @@
-+package translator
-+
-+import (
-+	"strings"
-+	"testing"
-+
-+	json "encoding/json/v2"
-+)
-+
-+// Regression tests for the role contract: Google's generateContent endpoints
-+// accept ONLY roles "user" and "model" inside contents — anything else draws
-+// 400 "Please use a valid role: user, model". System text belongs in the
-+// top-level systemInstruction. NormalizeGeminiRequest is the funnel that
-+// guarantees this for every Gemini-native payload the router sends.
-+
-+func TestNormalizeGeminiRequest_EnforcesRoleContract(t *testing.T) {
-+	req := &GeminiRequest{
-+		SystemInstruction: &GeminiContent{Role: "user", Parts: []GeminiPart{{Text: "existing instructions"}}},
-+		Contents: []GeminiContent{
-+			{Role: "system", Parts: []GeminiPart{{Text: "hoisted system text"}}},
-+			{Role: "developer", Parts: []GeminiPart{{Text: "hoisted developer text"}}},
-+			{Role: "user", Parts: []GeminiPart{{Text: "question"}}},
-+			{Role: "assistant", Parts: []GeminiPart{{FunctionCall: &GeminiFunctionCall{Name: "f"}}}},
-+			{Role: "assistant", Parts: []GeminiPart{{FunctionResponse: &GeminiFunctionResp{Name: "f"}}}},
-+		},
-+	}
-+	NormalizeGeminiRequest(req, "")
-+
-+	if req.SystemInstruction == nil {
-+		t.Fatal("systemInstruction missing")
-+	}
-+	var sysText string
-+	for _, p := range req.SystemInstruction.Parts {
-+		sysText += p.Text
-+	}
-+	if !strings.Contains(sysText, "existing instructions") || !strings.Contains(sysText, "hoisted system text") || !strings.Contains(sysText, "hoisted developer text") {
-+		t.Fatalf("systemInstruction lost parts: %q", sysText)
-+	}
-+
-+	for i, c := range req.Contents {
-+		if c.Role != "user" && c.Role != "model" {
-+			t.Errorf("contents[%d] role %q — only user/model allowed", i, c.Role)
-+		}
-+	}
-+	// The user turn, then the call turn (assistant→model), then the response
-+	// turn (functionResponse-bearing → user).
-+	roles := make([]string, 0, len(req.Contents))
-+	for _, c := range req.Contents {
-+		roles = append(roles, c.Role)
-+	}
-+	joined := strings.Join(roles, ",")
-+	if !strings.Contains(joined, "model") {
-+		t.Errorf("assistant turn not canonicalized to model: %q", joined)
-+	}
-+	if !strings.Contains(joined, "user") {
-+		t.Errorf("functionResponse turn not canonicalized to user: %q", joined)
-+	}
-+}
-+
-+// TranslateOpenAIToGemini must never place a system message inside contents.
-+func TestTranslateOpenAIToGemini_SystemNeverInsideContents(t *testing.T) {
-+	body := `{"model":"gemini-3-pro-preview","messages":[
-+		{"role":"system","content":"be terse"},
-+		{"role":"user","content":"hi"}
-+	]}`
-+	out, err := TranslateOpenAIToGemini([]byte(body))
-+	if err != nil {
-+		t.Fatalf("translate: %v", err)
-+	}
-+	var req GeminiRequest
-+	if err := json.Unmarshal(out, &req); err != nil {
-+		t.Fatal(err)
-+	}
-+	if req.SystemInstruction == nil || len(req.SystemInstruction.Parts) == 0 || req.SystemInstruction.Parts[0].Text != "be terse" {
-+		t.Fatalf("system message not hoisted into systemInstruction: %s", out)
-+	}
-+	for _, c := range req.Contents {
-+		if c.Role != "user" && c.Role != "model" {
-+			t.Fatalf("contents role %q reached the payload", c.Role)
-+		}
-+	}
-+}
-+
-+// WrapForAntigravity runs the same funnel over the wrapped body, so even a
-+// hand-built Gemini payload cannot carry a foreign role to cloudcode-pa.
-+func TestWrapForAntigravity_EnforcesRoleContract(t *testing.T) {
-+	geminiBody := []byte(`{"contents":[
-+		{"role":"system","parts":[{"text":"sys prompt"}]},
-+		{"role":"user","parts":[{"text":"hi"}]},
-+		{"role":"assistant","parts":[{"text":"hello"}]}
-+	]}`)
-+	wrapped, err := WrapForAntigravity(geminiBody, "proj-1", "gemini-3-pro-preview")
-+	if err != nil {
-+		t.Fatalf("wrap: %v", err)
-+	}
-+	var env AntigravityRequest
-+	if err := json.Unmarshal(wrapped, &env); err != nil {
-+		t.Fatal(err)
-+	}
-+	var req GeminiRequest
-+	if err := json.Unmarshal(env.Request, &req); err != nil {
-+		t.Fatal(err)
-+	}
-+	if req.SystemInstruction == nil || len(req.SystemInstruction.Parts) == 0 || req.SystemInstruction.Parts[0].Text != "sys prompt" {
-+		t.Fatalf("system content not hoisted by WrapForAntigravity: %s", env.Request)
-+	}
-+	for i, c := range req.Contents {
-+		if c.Role != "user" && c.Role != "model" {
-+			t.Errorf("wrapped contents[%d] role %q — only user/model allowed", i, c.Role)
-+		}
-+	}
-+}
-diff --git a/internal/translator/gemini_terminal_gate_test.go b/internal/translator/gemini_terminal_gate_test.go
-new file mode 100644
-index 0000000..a3299e2
---- /dev/null
-+++ b/internal/translator/gemini_terminal_gate_test.go
-@@ -0,0 +1,109 @@
-+package translator
-+
-+import (
-+	"strings"
-+	"testing"
-+
-+	json "encoding/json/v2"
-+	"encoding/json/jsontext"
-+)
-+
-+// The final-gate guarantee: a Gemini request body that ends with a model
-+// turn is rejected by the Gemini and Vertex generateContent endpoints
-+// ("Requests ending with a model turn are not supported."). The translator
-+// normalizes this already; EnsureGeminiTerminalUserTurn re-establishes it on
-+// the wire body so nothing between translator and socket can resurface the
-+// shape.
-+
-+func TestEnsureGeminiTerminalUserTurn_AppendsGuardTurn(t *testing.T) {
-+	body := []byte(`{"contents":[
-+		{"role":"user","parts":[{"text":"go"}]},
-+		{"role":"model","parts":[{"functionCall":{"name":"f","id":"call_1","args":{}}}]}
-+	]}`)
-+	out := EnsureGeminiTerminalUserTurn(body)
-+
-+	var req struct {
-+		Contents []struct {
-+			Role  string           `json:"role"`
-+			Parts []map[string]any `json:"parts"`
-+		} `json:"contents"`
-+	}
-+	if err := json.Unmarshal(out, &req); err != nil {
-+		t.Fatal(err)
-+	}
-+	if len(req.Contents) != 3 {
-+		t.Fatalf("expected 3 contents, got %d: %s", len(req.Contents), out)
-+	}
-+	last := req.Contents[len(req.Contents)-1]
-+	if last.Role != "user" {
-+		t.Fatalf("guard turn role %q, want user", last.Role)
-+	}
-+	if len(last.Parts) != 1 {
-+		t.Fatalf("guard parts: %v", last.Parts)
-+	}
-+	if fr, ok := last.Parts[0]["functionResponse"].(map[string]any); ok {
-+		if fr["name"] != "f" {
-+			t.Errorf("guard functionResponse name = %v", fr["name"])
-+		}
-+		if fr["id"] != "call_1" {
-+			t.Errorf("guard functionResponse id = %v, want call_1", fr["id"])
-+		}
-+	} else {
-+		t.Errorf("guard part is not a functionResponse: %v", last.Parts[0])
-+	}
-+}
-+
-+func TestEnsureGeminiTerminalUserTurn_TextModelTurnGetsNudge(t *testing.T) {
-+	body := []byte(`{"contents":[
-+		{"role":"user","parts":[{"text":"q"}]},
-+		{"role":"model","parts":[{"text":"partial answer"}]}
-+	]}`)
-+	out := EnsureGeminiTerminalUserTurn(body)
-+	if !strings.Contains(string(out), `"role":"user"`) {
-+		t.Fatalf("no guard turn: %s", out)
-+	}
-+	var req struct {
-+		Contents []struct {
-+			Role  string `json:"role"`
-+			Parts []struct {
-+				Text string `json:"text"`
-+			} `json:"parts"`
-+		} `json:"contents"`
-+	}
-+	if err := json.Unmarshal(out, &req); err != nil {
-+		t.Fatal(err)
-+	}
-+	last := req.Contents[len(req.Contents)-1]
-+	if last.Role != "user" || len(last.Parts) == 0 || last.Parts[0].Text == "" {
-+		t.Fatalf("guard nudge missing: %+v", last)
-+	}
-+}
-+
-+// A body already ending with user must pass through byte-identical.
-+func TestEnsureGeminiTerminalUserTurn_UserLastUntouched(t *testing.T) {
-+	body := []byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`)
-+	if out := EnsureGeminiTerminalUserTurn(body); string(out) != string(body) {
-+		t.Fatalf("user-last body rewritten: %s", out)
-+	}
-+}
-+
-+// Unknown top-level fields must survive (the struct round-trip lesson).
-+func TestEnsureGeminiTerminalUserTurn_PreservesOtherKeys(t *testing.T) {
-+	body := []byte(`{"systemInstruction":{"parts":[{"text":"sys"}]},
-+		"tools":[{"functionDeclarations":[{"name":"f"}]}],
-+		"contents":[
-+			{"role":"user","parts":[{"text":"q"}]},
-+			{"role":"model","parts":[{"text":"a"}]}
-+		]}`)
-+	out := EnsureGeminiTerminalUserTurn(body)
-+	var doc map[string]jsontext.Value
-+	if err := json.Unmarshal(out, &doc); err != nil {
-+		t.Fatal(err)
-+	}
-+	if _, ok := doc["systemInstruction"]; !ok {
-+		t.Error("systemInstruction dropped")
-+	}
-+	if _, ok := doc["tools"]; !ok {
-+		t.Error("tools dropped")
-+	}
-+}
 diff --git a/internal/constants/transport.go b/internal/constants/transport.go
-index 8a0df07..3fff67e 100644
+index 8a0df07e..3fff67e6 100644
 --- a/internal/constants/transport.go
 +++ b/internal/constants/transport.go
 @@ -3,6 +3,25 @@ package constants
@@ -308,10 +75,10 @@ index 8a0df07..3fff67e 100644
  
  // NewTransport instantiates a fresh *http.Transport with these settings applied and Proxy: nil.
 diff --git a/internal/translator/antigravity.go b/internal/translator/antigravity.go
-index ee33ac1..623feab 100644
+index 3986f5c8..1f51a668 100644
 --- a/internal/translator/antigravity.go
 +++ b/internal/translator/antigravity.go
-@@ -677,15 +677,14 @@ func fixAntigravityContents(req *GeminiRequest, model string) bool {
+@@ -802,15 +802,14 @@ func fixAntigravityContents(req *GeminiRequest, model string) bool {
  		}
  
  		if needsBackfill {
@@ -334,7 +101,7 @@ index ee33ac1..623feab 100644
  				}
  			}
  		}
-@@ -695,9 +694,13 @@ func fixAntigravityContents(req *GeminiRequest, model string) bool {
+@@ -820,9 +819,13 @@ func fixAntigravityContents(req *GeminiRequest, model string) bool {
  		}
  		fixed[i] = GeminiContent{Role: role, Parts: filtered}
  	}
@@ -352,10 +119,27 @@ index ee33ac1..623feab 100644
  	}
  	return false
 diff --git a/internal/translator/gemini.go b/internal/translator/gemini.go
-index bd8b9f4..82fc463 100644
+index ede7f076..247d2830 100644
 --- a/internal/translator/gemini.go
 +++ b/internal/translator/gemini.go
-@@ -377,7 +406,7 @@ func TranslateOpenAIToGemini(openaiBody []byte) ([]byte, error) {
+@@ -4,6 +4,7 @@ import (
+ 	"9router/proxy/internal/providers"
+ 	"9router/proxy/internal/thinking"
+ 	"bytes"
++	"encoding/base64"
+ 	"encoding/json/jsontext"
+ 	json "encoding/json/v2"
+ 	"fmt"
+@@ -336,7 +337,7 @@ func TranslateOpenAIToGeminiWithSession(openaiBody []byte, sessionID string) ([]
+ 				parts = append(parts, GeminiPart{Text: msg.ReasoningContent})
+ 			}
+ 
+-						// Tool calls → functionCall parts
++			// Tool calls → functionCall parts
+ 			for _, tc := range msg.ToolCalls {
+ 				var args map[string]any
+ 				if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+@@ -456,7 +457,7 @@ func TranslateOpenAIToGeminiWithSession(openaiBody []byte, sessionID string) ([]
  
  	// Normalize Gemini contents: merge adjacent same-role messages, strip empty parts,
  	// and ensure first turn is "user" (parity with decolua/9router v0.5.75 #e7b5f09).
@@ -363,8 +147,64 @@ index bd8b9f4..82fc463 100644
 +	NormalizeGeminiRequest(&req, oreq.Model)
  
  	// Tools
- 	if len(oreq.Tools) > 0 {
-@@ -1024,6 +1146,126 @@ func geminiToolMediaParts(content any) []GeminiPart {
+ 	// tool_choice maps to Gemini toolConfig mode:
+@@ -646,6 +647,41 @@ func extractThoughtSig(id string) string {
+ 	return ""
+ }
+ 
++// Bounds for a plausible Google thought signature. Real ones are base64
++// blobs of at least a few hundred bytes; the shipped defaults are 1-4KB.
++// Anything below the floor or above the cap is client-mangled garbage, not
++// a signature Google will accept.
++const (
++	thoughtSigMinEncodedLen = 64
++	thoughtSigMaxEncodedLen = 64 * 1024
++)
++
++// validThoughtSignature reports whether sig has the shape of a real Google// thought signature: long enough, short enough, and decodable as standard
++// base64 (padded or raw). Clients round-trip these inside tool_call IDs and
++// are free to mangle them — truncation, "+"→" " rewriting, percent-encoding
++// — and an invalid one reaches Google as "Corrupted thought signature.
++// INVALID_ARGUMENT", 400ing the request. Callers fall back to
++// DefaultThinkingSignature when this returns false.
++func validThoughtSignature(sig string) bool {
++	if len(sig) == 0 || len(sig) > thoughtSigMaxEncodedLen {
++		return false
++	}
++	if strings.HasPrefix(sig, "SIG_") || sig == "test_signature" {
++		return true
++	}
++	if len(sig) < thoughtSigMinEncodedLen {
++		return false
++	}
++	decoded, err := base64.StdEncoding.DecodeString(sig)
++	if err != nil {
++		decoded, err = base64.RawStdEncoding.DecodeString(sig)
++		if err != nil {
++			return false
++		}
++	}
++	return len(decoded) > 0
++}
++
+ // geminiCleanToolCallID drops the "__ts__<sig>" transport suffix from a tool
+ // call id, leaving the id the client actually sees. The suffix is a 9router-go
+ // encoding for carrying a thought signature back to Gemini, so it must never
+@@ -872,10 +908,9 @@ func TranslateGeminiResponseToOpenAI(geminiBody []byte) ([]byte, *OpenAIUsage, e
+ 		"choices": []map[string]any{{
+ 			"index": 0,
+ 			"message": map[string]any{
+-				"role":              "assistant",
+-				"content":           openaiContent,
+-				"reasoning_content": reasoningContent,
+-				"tool_calls":        toolCalls,
++				"role":       "assistant",
++				"content":    openaiContent,
++				"tool_calls": toolCalls,
+ 			},
+ 			"finish_reason": claudeStop,
+ 		}},
+@@ -1245,6 +1280,126 @@ func geminiToolMediaParts(content any) []GeminiPart {
  	return media
  }
  
@@ -491,3 +331,286 @@ index bd8b9f4..82fc463 100644
  // NormalizeGeminiContents merges adjacent same-role messages, strips empty
  // parts, and brackets the conversation with user turns — parity with
  // open-sse/translator/formats/gemini.js. Gemini rejects a contents array that
+@@ -1384,49 +1539,3 @@ func isGeminiPartEmpty(p GeminiPart) bool {
+ 		p.InlineData == nil &&
+ 		p.FileData == nil
+ }
+-
+-	}
+-	return ""
+-}
+-
+-// Bounds for a plausible Google thought signature. Real ones are base64
+-// blobs of at least a few hundred bytes; the shipped defaults are 1-4KB.
+-// Anything below the floor or above the cap is client-mangled garbage, not
+-// a signature Google will accept.
+-const (
+-	thoughtSigMinEncodedLen = 64
+-	thoughtSigMaxEncodedLen = 64 * 1024
+-)
+-
+-// validThoughtSignature reports whether sig has the shape of a real Google// thought signature: long enough, short enough, and decodable as standard
+-// base64 (padded or raw). Clients round-trip these inside tool_call IDs and
+-// are free to mangle them — truncation, "+"→" " rewriting, percent-encoding
+-// — and an invalid one reaches Google as "Corrupted thought signature.
+-// INVALID_ARGUMENT", 400ing the request. Callers fall back to
+-// DefaultThinkingSignature when this returns false.
+-func validThoughtSignature(sig string) bool {
+-	if len(sig) == 0 || len(sig) > thoughtSigMaxEncodedLen {
+-		return false
+-	}
+-	if strings.HasPrefix(sig, "SIG_") || sig == "test_signature" {
+-		return true
+-	}
+-	if len(sig) < thoughtSigMinEncodedLen {
+-		return false
+-	}
+-	decoded, err := base64.StdEncoding.DecodeString(sig)
+-	if err != nil {
+-		decoded, err = base64.RawStdEncoding.DecodeString(sig)
+-		if err != nil {
+-			return false
+-		}
+-	}
+-	return len(decoded) > 0
+-}
+-
+-// geminiCleanToolCallID drops the "__ts__<sig>" transport suffix from a tool
+-// call id, leaving the id the client actually sees. The suffix is a 9router-go
+-// encoding for carrying a thought signature back to Gemini, so it must never
+-// reach the wire nor appear on one side of a call/response pair only.
+-func geminiCleanToolCallID(id string) string {
+-	if ts := strings.LastIndex(id, "__ts__"); ts != -1 {
+diff --git a/internal/translator/gemini_role_contract_test.go b/internal/translator/gemini_role_contract_test.go
+new file mode 100644
+index 00000000..cebf3370
+--- /dev/null
++++ b/internal/translator/gemini_role_contract_test.go
+@@ -0,0 +1,112 @@
++package translator
++
++import (
++	"strings"
++	"testing"
++
++	json "encoding/json/v2"
++)
++
++// Regression tests for the role contract: Google's generateContent endpoints
++// accept ONLY roles "user" and "model" inside contents — anything else draws
++// 400 "Please use a valid role: user, model". System text belongs in the
++// top-level systemInstruction. NormalizeGeminiRequest is the funnel that
++// guarantees this for every Gemini-native payload the router sends.
++
++func TestNormalizeGeminiRequest_EnforcesRoleContract(t *testing.T) {
++	req := &GeminiRequest{
++		SystemInstruction: &GeminiContent{Role: "user", Parts: []GeminiPart{{Text: "existing instructions"}}},
++		Contents: []GeminiContent{
++			{Role: "system", Parts: []GeminiPart{{Text: "hoisted system text"}}},
++			{Role: "developer", Parts: []GeminiPart{{Text: "hoisted developer text"}}},
++			{Role: "user", Parts: []GeminiPart{{Text: "question"}}},
++			{Role: "assistant", Parts: []GeminiPart{{FunctionCall: &GeminiFunctionCall{Name: "f"}}}},
++			{Role: "assistant", Parts: []GeminiPart{{FunctionResponse: &GeminiFunctionResp{Name: "f"}}}},
++		},
++	}
++	NormalizeGeminiRequest(req, "")
++
++	if req.SystemInstruction == nil {
++		t.Fatal("systemInstruction missing")
++	}
++	var sysText string
++	for _, p := range req.SystemInstruction.Parts {
++		sysText += p.Text
++	}
++	if !strings.Contains(sysText, "existing instructions") || !strings.Contains(sysText, "hoisted system text") || !strings.Contains(sysText, "hoisted developer text") {
++		t.Fatalf("systemInstruction lost parts: %q", sysText)
++	}
++
++	for i, c := range req.Contents {
++		if c.Role != "user" && c.Role != "model" {
++			t.Errorf("contents[%d] role %q — only user/model allowed", i, c.Role)
++		}
++	}
++	// The user turn, then the call turn (assistant→model), then the response
++	// turn (functionResponse-bearing → user).
++	roles := make([]string, 0, len(req.Contents))
++	for _, c := range req.Contents {
++		roles = append(roles, c.Role)
++	}
++	joined := strings.Join(roles, ",")
++	if !strings.Contains(joined, "model") {
++		t.Errorf("assistant turn not canonicalized to model: %q", joined)
++	}
++	if !strings.Contains(joined, "user") {
++		t.Errorf("functionResponse turn not canonicalized to user: %q", joined)
++	}
++}
++
++// TranslateOpenAIToGemini must never place a system message inside contents.
++func TestTranslateOpenAIToGemini_SystemNeverInsideContents(t *testing.T) {
++	body := `{"model":"gemini-3-pro-preview","messages":[
++		{"role":"system","content":"be terse"},
++		{"role":"user","content":"hi"}
++	]}`
++	out, err := TranslateOpenAIToGemini([]byte(body))
++	if err != nil {
++		t.Fatalf("translate: %v", err)
++	}
++	var req GeminiRequest
++	if err := json.Unmarshal(out, &req); err != nil {
++		t.Fatal(err)
++	}
++	if req.SystemInstruction == nil || len(req.SystemInstruction.Parts) == 0 || req.SystemInstruction.Parts[0].Text != "be terse" {
++		t.Fatalf("system message not hoisted into systemInstruction: %s", out)
++	}
++	for _, c := range req.Contents {
++		if c.Role != "user" && c.Role != "model" {
++			t.Fatalf("contents role %q reached the payload", c.Role)
++		}
++	}
++}
++
++// WrapForAntigravity runs the same funnel over the wrapped body, so even a
++// hand-built Gemini payload cannot carry a foreign role to cloudcode-pa.
++func TestWrapForAntigravity_EnforcesRoleContract(t *testing.T) {
++	geminiBody := []byte(`{"contents":[
++		{"role":"system","parts":[{"text":"sys prompt"}]},
++		{"role":"user","parts":[{"text":"hi"}]},
++		{"role":"assistant","parts":[{"text":"hello"}]}
++	]}`)
++	wrapped, err := WrapForAntigravity(geminiBody, "proj-1", "gemini-3-pro-preview")
++	if err != nil {
++		t.Fatalf("wrap: %v", err)
++	}
++	var env AntigravityRequest
++	if err := json.Unmarshal(wrapped, &env); err != nil {
++		t.Fatal(err)
++	}
++	var req GeminiRequest
++	if err := json.Unmarshal(env.Request, &req); err != nil {
++		t.Fatal(err)
++	}
++	if req.SystemInstruction == nil || len(req.SystemInstruction.Parts) == 0 || req.SystemInstruction.Parts[0].Text != "sys prompt" {
++		t.Fatalf("system content not hoisted by WrapForAntigravity: %s", env.Request)
++	}
++	for i, c := range req.Contents {
++		if c.Role != "user" && c.Role != "model" {
++			t.Errorf("wrapped contents[%d] role %q — only user/model allowed", i, c.Role)
++		}
++	}
++}
+diff --git a/internal/translator/gemini_terminal_gate_test.go b/internal/translator/gemini_terminal_gate_test.go
+new file mode 100644
+index 00000000..a3299e2c
+--- /dev/null
++++ b/internal/translator/gemini_terminal_gate_test.go
+@@ -0,0 +1,109 @@
++package translator
++
++import (
++	"strings"
++	"testing"
++
++	json "encoding/json/v2"
++	"encoding/json/jsontext"
++)
++
++// The final-gate guarantee: a Gemini request body that ends with a model
++// turn is rejected by the Gemini and Vertex generateContent endpoints
++// ("Requests ending with a model turn are not supported."). The translator
++// normalizes this already; EnsureGeminiTerminalUserTurn re-establishes it on
++// the wire body so nothing between translator and socket can resurface the
++// shape.
++
++func TestEnsureGeminiTerminalUserTurn_AppendsGuardTurn(t *testing.T) {
++	body := []byte(`{"contents":[
++		{"role":"user","parts":[{"text":"go"}]},
++		{"role":"model","parts":[{"functionCall":{"name":"f","id":"call_1","args":{}}}]}
++	]}`)
++	out := EnsureGeminiTerminalUserTurn(body)
++
++	var req struct {
++		Contents []struct {
++			Role  string           `json:"role"`
++			Parts []map[string]any `json:"parts"`
++		} `json:"contents"`
++	}
++	if err := json.Unmarshal(out, &req); err != nil {
++		t.Fatal(err)
++	}
++	if len(req.Contents) != 3 {
++		t.Fatalf("expected 3 contents, got %d: %s", len(req.Contents), out)
++	}
++	last := req.Contents[len(req.Contents)-1]
++	if last.Role != "user" {
++		t.Fatalf("guard turn role %q, want user", last.Role)
++	}
++	if len(last.Parts) != 1 {
++		t.Fatalf("guard parts: %v", last.Parts)
++	}
++	if fr, ok := last.Parts[0]["functionResponse"].(map[string]any); ok {
++		if fr["name"] != "f" {
++			t.Errorf("guard functionResponse name = %v", fr["name"])
++		}
++		if fr["id"] != "call_1" {
++			t.Errorf("guard functionResponse id = %v, want call_1", fr["id"])
++		}
++	} else {
++		t.Errorf("guard part is not a functionResponse: %v", last.Parts[0])
++	}
++}
++
++func TestEnsureGeminiTerminalUserTurn_TextModelTurnGetsNudge(t *testing.T) {
++	body := []byte(`{"contents":[
++		{"role":"user","parts":[{"text":"q"}]},
++		{"role":"model","parts":[{"text":"partial answer"}]}
++	]}`)
++	out := EnsureGeminiTerminalUserTurn(body)
++	if !strings.Contains(string(out), `"role":"user"`) {
++		t.Fatalf("no guard turn: %s", out)
++	}
++	var req struct {
++		Contents []struct {
++			Role  string `json:"role"`
++			Parts []struct {
++				Text string `json:"text"`
++			} `json:"parts"`
++		} `json:"contents"`
++	}
++	if err := json.Unmarshal(out, &req); err != nil {
++		t.Fatal(err)
++	}
++	last := req.Contents[len(req.Contents)-1]
++	if last.Role != "user" || len(last.Parts) == 0 || last.Parts[0].Text == "" {
++		t.Fatalf("guard nudge missing: %+v", last)
++	}
++}
++
++// A body already ending with user must pass through byte-identical.
++func TestEnsureGeminiTerminalUserTurn_UserLastUntouched(t *testing.T) {
++	body := []byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`)
++	if out := EnsureGeminiTerminalUserTurn(body); string(out) != string(body) {
++		t.Fatalf("user-last body rewritten: %s", out)
++	}
++}
++
++// Unknown top-level fields must survive (the struct round-trip lesson).
++func TestEnsureGeminiTerminalUserTurn_PreservesOtherKeys(t *testing.T) {
++	body := []byte(`{"systemInstruction":{"parts":[{"text":"sys"}]},
++		"tools":[{"functionDeclarations":[{"name":"f"}]}],
++		"contents":[
++			{"role":"user","parts":[{"text":"q"}]},
++			{"role":"model","parts":[{"text":"a"}]}
++		]}`)
++	out := EnsureGeminiTerminalUserTurn(body)
++	var doc map[string]jsontext.Value
++	if err := json.Unmarshal(out, &doc); err != nil {
++		t.Fatal(err)
++	}
++	if _, ok := doc["systemInstruction"]; !ok {
++		t.Error("systemInstruction dropped")
++	}
++	if _, ok := doc["tools"]; !ok {
++		t.Error("tools dropped")
++	}
++}
