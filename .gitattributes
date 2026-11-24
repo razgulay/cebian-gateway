@@ -1,0 +1,12 @@
+# Narrow on purpose. Only two kinds of file here break under CRLF:
+#
+#   *.patch  GNU patch inside the alpine build stage reads these. A CRLF patch
+#            fails with "malformed patch" or applies garbage.
+#   *.sh     start.sh runs under /bin/sh in the container. CRLF gives
+#            "\r: not found" and the container dies at boot.
+#
+# server.js and the Dockerfile are stored CRLF upstream of this change and
+# build fine that way. Do NOT add `* text=auto eol=lf` here: it rewrites every
+# line of them and buries the real diff.
+*.patch   text eol=lf
+*.sh      text eol=lf
