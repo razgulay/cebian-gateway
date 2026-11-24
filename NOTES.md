@@ -10,12 +10,46 @@ three processes under one public port:
 ## What "restored" means here
 
 As of 2026-11-24 this repo tracks **upstream 9router-go v1.9.16 (commit
-`0a1cf785`)** with **exactly one local patch** — `0010` (CORS).
+`0a1cf785`)** with **two local patches** — `0010` (CORS) and `0011` (empty-schema
+placeholder must be optional).
 
 Patches `0001` through `0009` were **removed**. They had accumulated over weeks
 of debugging and were never upstream: the router is now vanilla, so every
 behaviour you read in the upstream README, CHANGELOG and docs is the behaviour
 that actually runs.
+
+### Why 0011 survives
+
+`internal/translator/schema.go` injects a placeholder `reason` property when a
+tool schema arrives with empty `properties`. Gemini's protobuf rejects a
+function declaration with no `properties`, so a placeholder is genuinely
+required — but upstream also marks it **`required`**, and that is the bug.
+
+Measured against `ag/gemini-3.8-flash`, same tool, zero declared arguments:
+
+| placeholder state | what the model returned |
+| --- | --- |
+| `required: ["reason"]` (upstream) | `{"reason":"User requested to call the tool."}` |
+| no `required` (this patch) | `{}` |
+
+So every zero-argument tool call on the Gemini lane came back carrying a
+fabricated `reason`. A client that validates arguments against the declared
+schema rejects that call; a client that ignores it silently passes junk onward.
+It reproduces on both lanes — `/v1/chat/completions` returns it in `arguments`,
+`/v1/messages` returns it in `input`.
+
+The injection only fires when `properties` is empty. A tool that declares real
+parameters is untouched (`{"x":"1"}` came back clean), which is why this looked
+like "some tools work, some don't".
+
+Why patch here and not in the client: the bogus argument is produced entirely
+server-side, for every caller, on every model routed through the Gemini
+translator. Patching a client means filtering it in each one.
+
+The patch keeps the placeholder (so Gemini still accepts the schema) and only
+drops `required`. Upstream's own parity test
+(`TestCleanParametersSchema_StripsNextJSUnsupportedKeywords`) asserts
+`properties != nil` and never required the field, so it still passes.
 
 ### Why 0010 survives
 

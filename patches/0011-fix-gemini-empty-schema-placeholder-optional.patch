@@ -1,0 +1,126 @@
+diff --git a/internal/translator/schema.go b/internal/translator/schema.go
+index 303f961..a4946a0 100644
+--- a/internal/translator/schema.go
++++ b/internal/translator/schema.go
+@@ -278,7 +278,15 @@ func cleanGeminiSchema(schema map[string]any) {
+ 		}
+ 	}
+ 
+-	// Add placeholder for empty object schemas (Antigravity requirement)
++	// Add placeholder for empty object schemas (Antigravity requirement).
++	//
++	// Gemini's protobuf rejects a function declaration whose parameters object
++	// carries no `properties`, so an empty schema has to be given one. The
++	// placeholder field must stay OPTIONAL: marking it required made the model
++	// emit {"reason": "..."} for tools that genuinely take no arguments, and a
++	// strict client rejects that as an unexpected argument. Verified against
++	// ag/gemini-3.8-flash — with `required` present the model always filled the
++	// field in; with it dropped the same request returns {}.
+ 	if t, hasT := schema["type"]; hasT && t == "object" {
+ 		needsPlaceholder := true
+ 		if propsRaw, hasProps := schema["properties"]; hasProps {
+@@ -290,10 +298,10 @@ func cleanGeminiSchema(schema map[string]any) {
+ 			schema["properties"] = map[string]any{
+ 				"reason": map[string]any{
+ 					"type":        "string",
+-					"description": "Brief explanation of why you are calling this tool",
++					"description": "Optional. Only include this when a short justification genuinely helps; omit it otherwise.",
+ 				},
+ 			}
+-			schema["required"] = []string{"reason"}
++			delete(schema, "required")
+ 		}
+ 	}
+ 
+@@ -303,10 +311,10 @@ func cleanGeminiSchema(schema map[string]any) {
+ 		schema["properties"] = map[string]any{
+ 			"reason": map[string]any{
+ 				"type":        "string",
+-				"description": "Brief explanation of why you are calling this tool",
++				"description": "Optional. Only include this when a short justification genuinely helps; omit it otherwise.",
+ 			},
+ 		}
+-		schema["required"] = []string{"reason"}
++		delete(schema, "required")
+ 	}
+ }
+ 
+diff --git a/internal/translator/schema_placeholder_optional_test.go b/internal/translator/schema_placeholder_optional_test.go
+new file mode 100644
+index 0000000..01828b3
+--- /dev/null
++++ b/internal/translator/schema_placeholder_optional_test.go
+@@ -0,0 +1,73 @@
++package translator
++
++import (
++	"encoding/json"
++	"strings"
++	"testing"
++)
++
++// The empty-schema placeholder exists because Gemini's protobuf rejects a
++// function declaration whose parameters object carries no `properties`. The
++// placeholder field must remain OPTIONAL: when it was marked `required`, the
++// model emitted {"reason":"..."} for tools that take no arguments at all, and a
++// client that validates arguments against the declared schema rejects the call
++// as an unexpected property.
++//
++// Regression guard for: gateway returning bogus `reason` arguments to
++// zero-argument tools on the Gemini lane.
++func TestCleanParametersSchema_EmptyPlaceholderIsOptional(t *testing.T) {
++	cases := []struct {
++		name  string
++		input string
++	}{
++		{"type object with empty properties", `{"type":"object","properties":{}}`},
++		{"type object with empty properties and additionalProperties", `{"type":"object","properties":{},"additionalProperties":false}`},
++		{"bare type object", `{"type":"object"}`},
++		{"totally empty schema", `{}`},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			out := CleanParametersSchema([]byte(tc.input))
++
++			var parsed map[string]any
++			if err := json.Unmarshal(out, &parsed); err != nil {
++				t.Fatalf("unmarshal output: %v (out: %s)", err, string(out))
++			}
++
++			// Gemini still needs a concrete object with at least one property.
++			if parsed["type"] != "object" {
++				t.Errorf("type must be object, got %v (out: %s)", parsed["type"], string(out))
++			}
++			props, ok := parsed["properties"].(map[string]any)
++			if !ok || len(props) == 0 {
++				t.Fatalf("placeholder properties missing, got %v (out: %s)", parsed["properties"], string(out))
++			}
++
++			// The whole point: the placeholder must NOT be required.
++			if req, has := parsed["required"]; has {
++				t.Errorf("placeholder must not be required, got required=%v (out: %s)", req, string(out))
++			}
++			if strings.Contains(string(out), `"required":["reason"]`) {
++				t.Errorf("reason must not appear in required (out: %s)", string(out))
++			}
++		})
++	}
++}
++
++// A tool that declares real required arguments must keep them untouched — the
++// fix only applies to the injected placeholder.
++func TestCleanParametersSchema_KeepsRealRequired(t *testing.T) {
++	input := `{"type":"object","properties":{"path":{"type":"string"},"mode":{"type":"string"}},"required":["path"]}`
++
++	out := CleanParametersSchema([]byte(input))
++
++	var parsed map[string]any
++	if err := json.Unmarshal(out, &parsed); err != nil {
++		t.Fatalf("unmarshal output: %v", err)
++	}
++	req, ok := parsed["required"].([]any)
++	if !ok || len(req) != 1 || req[0] != "path" {
++		t.Fatalf("real required must survive, got %v (out: %s)", parsed["required"], string(out))
++	}
++}

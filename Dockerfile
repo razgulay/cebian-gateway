@@ -7,15 +7,20 @@
 #   9router-go :20130 internal (LLM router + embedded Svelte dashboard)
 #
 # WHY SOURCE BUILD (do not "simplify" this back to the prebuilt release binary):
-# patch 0010 (CORS) is not in upstream v1.9.16, and the prebuilt release
-# binaries on GitHub contain none of the local patches. Without 0010 the gateway
-# emits no CORS headers and chi answers preflight OPTIONS /v1/messages with 405,
-# so every browser-based client (Claude for Office webview, web apps) dies with
-# a bare "Failed to fetch" while curl/SDK clients work fine.
+# neither local patch is in upstream v1.9.16, and the prebuilt release binaries
+# on GitHub contain none of them.
+#   0010 CORS: without it the gateway emits no CORS headers and chi answers
+#   preflight OPTIONS /v1/messages with 405, so every browser-based client
+#   (Claude for Office webview, web apps) dies with a bare "Failed to fetch"
+#   while curl/SDK clients work fine.
+#   0011 placeholder: upstream marks the injected empty-schema `reason` field as
+#   REQUIRED, so the model emits {"reason":"..."} for tools that take no
+#   arguments and a strict client rejects the call. Verified against
+#   ag/gemini-3.8-flash: required -> bogus reason, dropped -> {}.
 #
 # RESTORED TO VANILLA (2026-11-24): patches 0001-0009 were removed. This image
-# now tracks upstream v1.9.16 with exactly one local patch. See NOTES.md for
-# what each retired patch used to do and what regresses without it.
+# tracks upstream v1.9.16 with two local patches. See NOTES.md for what each
+# retired patch used to do and what regresses without it.
 # ──────────────────────────────────────────────────────────────────────────────
 # Pinned upstream commit = tag v1.9.16 (2026-11-12, 0a1cf78). Full 40-char SHA,
 # not a branch — the build is reproducible. Bump to upgrade, then re-verify the
@@ -38,6 +43,9 @@ RUN apk add --no-cache curl tar patch \
  && for p in /patches/*.patch; do echo "[patch] applying $(basename "$p")"; patch -p1 --no-backup-if-mismatch < "$p"; done \
  && grep -q "corsPreflightMaxAge" internal/middleware/cors.go \
  && grep -q "middleware.CORS" internal/app/handlers.go \
+ && grep -q "placeholder field must stay OPTIONAL" internal/translator/schema.go \
+ && grep -q "TestCleanParametersSchema_EmptyPlaceholderIsOptional" internal/translator/schema_placeholder_optional_test.go \
+ && grep -q "Only include this when a short justification" internal/translator/schema.go \
  && echo "[patch] all fix markers present"
 
 # ── Build the dashboard SPA (bun + Vite) ──────────────────────────────────────
