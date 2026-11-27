@@ -9,9 +9,14 @@ three processes under one public port:
 
 ## What "restored" means here
 
-As of 2026-11-24 this repo tracks **upstream 9router-go v1.9.16 (commit
-`0a1cf785`)** with **two local patches** — `0010` (CORS) and `0011` (empty-schema
+As of 2026-11-27 this repo tracks **upstream 9router-go v1.9.17 (commit
+`2a809a7e`)** with **two local patches** — `0010` (CORS) and `0011` (empty-schema
 placeholder must be optional).
+
+Upgraded from v1.9.16 on 2026-11-27. Both patches survive the bump: `0011`
+applied to v1.9.17 unchanged (only its blob hashes moved), and `0010` needed one
+line re-anchored because `internal/app/handlers.go` grew a path-aware body-limit
+block in the same spot — the middleware itself and its tests are unchanged.
 
 Patches `0001` through `0009` were **removed**. They had accumulated over weeks
 of debugging and were never upstream: the router is now vanilla, so every
@@ -97,20 +102,23 @@ Recorded so the next person does not re-derive it after a bad night:
 - **0009** — `REASONING_FIELD` selector for the OpenAI output shape. A local
   feature, not a fix.
 
-If any of those symptoms return, re-port the specific patch against `0a1cf785`
+If any of those symptoms return, re-port the specific patch against `2a809a7e`
 rather than resurrecting the pile. `git apply --check` on the old patches shows
-0001, 0004 and 0005 **no longer apply** to later upstream anyway.
+0001, 0004 and 0005 **no longer apply** to later upstream anyway. The retired
+patches are still in history at commit `a557243` if you need to read them.
 
 ## Upgrading
 
 Bump `ROUTER_SHA` in the `Dockerfile` to the new tag's full 40-char SHA. The
-`src` stage asserts the patch markers and **fails the build** if 0010 stops
-applying, so a silent revert cannot ship.
+`src` stage asserts the patch markers and **fails the build** if a patch stops
+applying, so a silent revert cannot ship. Also move the `golang:*` builder tag if
+the new tag's `go.mod` names a different toolchain (v1.9.17 names go1.27.4).
 
 ## Layout
 
     Dockerfile          pinned SHA, patch apply + marker assertions, SPA build, Go build
-    patches/0010-*      the only surviving local patch
+    patches/0010-*      CORS for the engine API (browser clients)
+    patches/0011-*      empty-schema placeholder must not be required (Gemini lane)
     proxy.mjs           single-public-port splitter (router owns / because the SPA
                         uses absolute /assets and /api paths)
     server.js           Telegram relay

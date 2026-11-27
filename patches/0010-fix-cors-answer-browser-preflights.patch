@@ -1,18 +1,18 @@
 diff --git a/internal/app/handlers.go b/internal/app/handlers.go
-index 4de3acc3..9b246520 100644
+index a04d568f..339a0f03 100644
 --- a/internal/app/handlers.go
 +++ b/internal/app/handlers.go
-@@ -69,6 +69,10 @@ func ProvideTokenSaverConfig(repo *db.Repo, params CLIParams) *handlers.TokenSav
- func ProvideRouter(repo *db.Repo, ts *handlers.TokenSaverConfig) (*chi.Mux, *chat.ChatHandler) {
+@@ -75,6 +75,10 @@ func ProvideRouter(repo *db.Repo, ts *handlers.TokenSaverConfig) (*chi.Mux, *cha
+ 	}
  	r := chi.NewRouter()
  	r.Use(middleware.RequestID)
 +	// CORS before auth/routing: preflight OPTIONS must answer 204 here, else
 +	// chi's route tree 405s it (only POST/GET are registered on /v1/*) and
 +	// every browser client dies at preflight with a bare "Failed to fetch".
 +	r.Use(middleware.CORS)
- 	// Body limits are path-aware: JSON APIs keep the 10MB ceiling, the media
- 	// endpoints that receive multipart video/audio bodies get their own larger
- 	// one (middleware.MediaBodyLimitRules). One middleware decides the ceiling
+ 	// Body limits are path-aware: JSON APIs get the configurable ceiling
+ 	// (MAX_JSON_BODY_SIZE_MB, 10MB by default), the media endpoints that
+ 	// receive multipart video/audio bodies get their own larger one
 diff --git a/internal/middleware/cors.go b/internal/middleware/cors.go
 new file mode 100644
 index 00000000..94fa6f65

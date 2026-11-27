@@ -1,5 +1,5 @@
 diff --git a/internal/translator/schema.go b/internal/translator/schema.go
-index 303f961..a4946a0 100644
+index 6b534c76..d599ab4f 100644
 --- a/internal/translator/schema.go
 +++ b/internal/translator/schema.go
 @@ -278,7 +278,15 @@ func cleanGeminiSchema(schema map[string]any) {
@@ -47,7 +47,7 @@ index 303f961..a4946a0 100644
  
 diff --git a/internal/translator/schema_placeholder_optional_test.go b/internal/translator/schema_placeholder_optional_test.go
 new file mode 100644
-index 0000000..01828b3
+index 00000000..01828b3b
 --- /dev/null
 +++ b/internal/translator/schema_placeholder_optional_test.go
 @@ -0,0 +1,73 @@

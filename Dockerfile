@@ -7,7 +7,7 @@
 #   9router-go :20130 internal (LLM router + embedded Svelte dashboard)
 #
 # WHY SOURCE BUILD (do not "simplify" this back to the prebuilt release binary):
-# neither local patch is in upstream v1.9.16, and the prebuilt release binaries
+# neither local patch is in upstream v1.9.17, and the prebuilt release binaries
 # on GitHub contain none of them.
 #   0010 CORS: without it the gateway emits no CORS headers and chi answers
 #   preflight OPTIONS /v1/messages with 405, so every browser-based client
@@ -19,21 +19,21 @@
 #   ag/gemini-3.8-flash: required -> bogus reason, dropped -> {}.
 #
 # RESTORED TO VANILLA (2026-11-24): patches 0001-0009 were removed. This image
-# tracks upstream v1.9.16 with two local patches. See NOTES.md for what each
+# tracks upstream v1.9.17 with two local patches. See NOTES.md for what each
 # retired patch used to do and what regresses without it.
 # ──────────────────────────────────────────────────────────────────────────────
-# Pinned upstream commit = tag v1.9.16 (2026-11-12, 0a1cf78). Full 40-char SHA,
+# Pinned upstream commit = tag v1.9.17 (2026-11-26, 2a809a7). Full 40-char SHA,
 # not a branch — the build is reproducible. Bump to upgrade, then re-verify the
-# patch still applies (the src stage fails the build if it no longer does).
-ARG ROUTER_SHA=0a1cf7853f7d7e5392c0b790388f13847b3b0c6e
+# patches still apply (the src stage fails the build if one no longer does).
+ARG ROUTER_SHA=2a809a7e2974cc9140a928fbf2bdde5bcacadcf2
 
-# ── Fetch upstream source once, at the pinned commit, and apply the local patch ─
+# ── Fetch upstream source once, at the pinned commit, and apply the local patches ─
 FROM alpine:3.21 AS src
 ARG ROUTER_SHA
 COPY patches/ /patches/
 
-# The grep assertions below fail the build if the patch ever lands as a no-op, so
-# a silent revert can never ship. Each marker is a string only the patch adds.
+# The grep assertions below fail the build if a patch ever lands as a no-op, so
+# a silent revert can never ship. Each marker is a string only its patch adds.
 RUN apk add --no-cache curl tar patch \
  && curl -fsSL "https://codeload.github.com/luqman-v1/9router-go/tar.gz/${ROUTER_SHA}" -o /tmp/src.tgz \
  && mkdir -p /src \
@@ -64,7 +64,10 @@ WORKDIR /src/web
 RUN bun install --frozen-lockfile && bun run build
 
 # ── Build the Go binary with the SPA embedded ─────────────────────────────────
-FROM golang:1.27.3-alpine AS go-builder
+# Pinned to 1.27.4, not the floating 1.27-alpine tag: v1.9.17's go.mod carries
+# `toolchain go1.27.4`, and matching it here keeps the build off a toolchain
+# download at compile time.
+FROM golang:1.27.4-alpine AS go-builder
 WORKDIR /src
 COPY --from=src /src/ ./
 COPY --from=web-builder /src/web/dist ./web/dist
